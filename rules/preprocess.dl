@@ -1,0 +1,84 @@
+// preprocess.dl — 阶段1：按函数范围过滤 VEX IR facts
+// 输入: addr_func, set_loc_vex, set_mem_vex, get_mem_vex_exp,
+//        exit_vex_exp, binop_vex_exp, imm_vex_exp, compiler_build_in
+// 输出: filtered_func, filter_set_loc_vex, filter_set_mem_vex,
+//        filter_get_mem_vex_exp, filter_exit_vex_exp, filter_binop_vex_exp
+
+// ── 输入声明 ──────────────────────────────────────────────────────────────────
+
+.decl addr_func(func:symbol, addr:number, size:number)
+.input addr_func
+
+.decl compiler_build_in(func:symbol)
+.input compiler_build_in
+
+.decl set_loc_vex(irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+.input set_loc_vex
+
+.decl set_mem_vex(irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+.input set_mem_vex
+
+.decl get_loc_vex_exp(regid:symbol, regEid:number)
+.input get_loc_vex_exp
+
+.decl get_mem_vex_exp(irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:symbol, regEid:number)
+.input get_mem_vex_exp
+
+.decl exit_vex_exp(irsbAddr:number, instructionAddr:number, irOrder:number, num:number, guard_eid:number, dst_eid:number, jumpkind:symbol, offsIP:number, dst_size_bit:number)
+.input exit_vex_exp
+
+.decl binop_vex_exp(addr:number, Nvec:symbol, Data1Eid:number, Data2Eid:number, LabelEid:number)
+.input binop_vex_exp
+
+.decl imm_vex_exp(size:number, value:symbol, conEid:number)
+.input imm_vex_exp
+
+// ── 函数范围计算 ──────────────────────────────────────────────────────────────
+
+.decl func_range(func:symbol, start_addr:number, end_addr:number)
+func_range(func, start, start + size) :- addr_func(func, start, size).
+.output func_range(filename="func_range.facts")
+
+// 排除编译器内建函数
+.decl filtered_func(func:symbol, start_addr:number, end_addr:number)
+filtered_func(func, start, end) :-
+    func_range(func, start, end),
+    !compiler_build_in(func).
+.output filtered_func(filename="filtered_func.facts")
+
+// ── 按函数范围过滤各类 VEX facts ──────────────────────────────────────────────
+
+.decl filter_set_loc_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+filter_set_loc_vex(func, irsbAddr, instructionAddr, irOrder, size, dataEid, regEid) :-
+    set_loc_vex(irsbAddr, instructionAddr, irOrder, size, dataEid, regEid),
+    filtered_func(func, start, end),
+    irsbAddr >= start, irsbAddr <= end.
+.output filter_set_loc_vex(filename="filter_set_loc_vex.facts")
+
+.decl filter_set_mem_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+filter_set_mem_vex(func, irsbAddr, instructionAddr, irOrder, size, dataEid, regEid) :-
+    set_mem_vex(irsbAddr, instructionAddr, irOrder, size, dataEid, regEid),
+    filtered_func(func, start, end),
+    irsbAddr >= start, irsbAddr <= end.
+.output filter_set_mem_vex(filename="filter_set_mem_vex.facts")
+
+.decl filter_get_mem_vex_exp(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:symbol, regEid:number)
+filter_get_mem_vex_exp(func, irsbAddr, instructionAddr, irOrder, size, dataEid, regEid) :-
+    get_mem_vex_exp(irsbAddr, instructionAddr, irOrder, size, dataEid, regEid),
+    filtered_func(func, start, end),
+    irsbAddr >= start, irsbAddr <= end.
+.output filter_get_mem_vex_exp(filename="filter_get_mem_vex_exp.facts")
+
+.decl filter_exit_vex_exp(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, num:number, guard_eid:number, dst_eid:number, jumpkind:symbol, offsIP:number, dst_size_bit:number)
+filter_exit_vex_exp(func, irsbAddr, instructionAddr, irOrder, num, guard_eid, dst_eid, jumpkind, offsIP, dst_size_bit) :-
+    exit_vex_exp(irsbAddr, instructionAddr, irOrder, num, guard_eid, dst_eid, jumpkind, offsIP, dst_size_bit),
+    filtered_func(func, start, end),
+    irsbAddr >= start, irsbAddr <= end.
+.output filter_exit_vex_exp(filename="filter_exit_vex_exp.facts")
+
+.decl filter_binop_vex_exp(addr:number, Nvec:symbol, Data1Eid:number, Data2Eid:number, LabelEid:number)
+filter_binop_vex_exp(addr, Nvec, Data1Eid, Data2Eid, LabelEid) :-
+    binop_vex_exp(addr, Nvec, Data1Eid, Data2Eid, LabelEid),
+    filtered_func(_, start, end),
+    addr >= start, addr <= end.
+.output filter_binop_vex_exp(filename="filter_binop_vex_exp.facts")

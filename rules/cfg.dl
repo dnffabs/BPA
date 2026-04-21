@@ -1,0 +1,68 @@
+// cfg.dl — 控制流图构建（BPA-X 阶段三）
+//
+// 输入: cfg_edge_raw, call_site_raw, filtered_func, addr_func
+// 输出: cfg_node, cfg_edge, call_graph, cfg_reachable
+
+.decl cfg_edge_raw(from_irsb:number, to_irsb:number, edge_type:symbol)
+.input cfg_edge_raw(filename="cfg_edge_raw.facts")
+
+.decl call_site_raw(caller_irsb:number, instr_addr:number, target_addr:number)
+.input call_site_raw(filename="call_site_raw.facts")
+
+.decl filtered_func(func:symbol, start_addr:number, end_addr:number)
+.input filtered_func
+
+.decl addr_func(func:symbol, start_addr:number, size:number)
+.input addr_func
+
+// ── 辅助：地址 → 函数名 ───────────────────────────────────────────────────────
+
+.decl irsb_in_func(func:symbol, irsb:number)
+irsb_in_func(func, irsb) :-
+    filtered_func(func, start, end),
+    cfg_edge_raw(irsb, _, _),
+    irsb >= start, irsb < end.
+irsb_in_func(func, irsb) :-
+    filtered_func(func, start, end),
+    cfg_edge_raw(_, irsb, _),
+    irsb >= start, irsb < end.
+
+.decl func_start(func:symbol, start:number)
+func_start(func, start) :- addr_func(func, start, _), start > 0.
+
+// ── cfg_node ──────────────────────────────────────────────────────────────────
+
+.decl cfg_node(func:symbol, irsb:number)
+cfg_node(func, irsb) :- irsb_in_func(func, irsb).
+
+// ── cfg_edge（函数内边）────────────────────────────────────────────────────────
+
+.decl cfg_edge(func:symbol, from_irsb:number, to_irsb:number, edge_type:symbol)
+cfg_edge(func, from_irsb, to_irsb, edge_type) :-
+    cfg_edge_raw(from_irsb, to_irsb, edge_type),
+    edge_type != "call",
+    irsb_in_func(func, from_irsb),
+    irsb_in_func(func, to_irsb).
+
+// ── call_graph（直接调用）─────────────────────────────────────────────────────
+
+.decl call_graph(caller_func:symbol, callee_func:symbol, call_site:number)
+call_graph(caller, callee, instr_addr) :-
+    call_site_raw(caller_irsb, instr_addr, target),
+    irsb_in_func(caller, caller_irsb),
+    func_start(callee, target).
+
+// ── cfg_reachable（传递闭包）──────────────────────────────────────────────────
+
+.decl cfg_reachable(func:symbol, from_irsb:number, to_irsb:number)
+cfg_reachable(func, a, b) :- cfg_edge(func, a, b, _).
+cfg_reachable(func, a, c) :-
+    cfg_reachable(func, a, b),
+    cfg_edge(func, b, c, _).
+
+// ── 输出 ──────────────────────────────────────────────────────────────────────
+
+.output cfg_node(filename="cfg_node.facts")
+.output cfg_edge(filename="cfg_edge.facts")
+.output call_graph(filename="call_graph.facts")
+.output cfg_reachable(filename="cfg_reachable.facts")

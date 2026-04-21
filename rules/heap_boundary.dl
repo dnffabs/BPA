@@ -1,0 +1,85 @@
+// heap_boundary.dl — 堆内存块边界识别 + 堆 A-loc 生成（BPA-X 算法）
+//
+// 输入: heap_alloc_call(func, callSite, allocFunc, size)
+//        filter_set_loc_vex, get_loc_vex_exp
+// 输出: heap_boundary(func, callSite, size)
+//        heap_aloc(alocId, func, callSite, size)
+//        store_to_heap_aloc(instrAddr, valueEid, alocId)
+//        load_from_heap_aloc(instrAddr, resultEid, alocId)
+
+// ── 输入声明 ──────────────────────────────────────────────────────────────────
+
+// 由 extract_heap_calls.py 生成
+.decl heap_alloc_call(func:symbol, callSite:number, allocFunc:symbol, size:number)
+.input heap_alloc_call(filename="heap_alloc_call.facts")
+
+.decl filter_set_loc_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+.input filter_set_loc_vex
+
+.decl filter_set_mem_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, addrEid:number)
+.input filter_set_mem_vex
+
+.decl filter_get_mem_vex_exp(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:symbol, addrEid:number)
+.input filter_get_mem_vex_exp
+
+.decl get_loc_vex_exp(regName:symbol, regEid:number)
+.input get_loc_vex_exp
+
+// ── Step 1: 生成堆边界和堆 A-loc ─────────────────────────────────────────────
+// 每个 callSite 对应一个堆内存块，ID = heap_<func>_<callSite>
+
+.decl heap_boundary(func:symbol, callSite:number, size:number)
+heap_boundary(func, callSite, size) :-
+    heap_alloc_call(func, callSite, _, size),
+    size > 0.
+// 未知大小（size=-1）也保留，标记为 -1
+heap_boundary(func, callSite, -1) :-
+    heap_alloc_call(func, callSite, _, -1).
+
+.decl heap_aloc(alocId:symbol, func:symbol, callSite:number, size:number)
+heap_aloc(cat("heap_", cat(func, cat("_", to_string(callSite)))), func, callSite, size) :-
+    heap_boundary(func, callSite, size).
+
+// ── Step 2: 追踪 malloc 返回值（rax）─────────────────────────────────────────
+// malloc 返回值在 rax 中，callSite 之后第一条 rax 赋值即为堆指针
+
+.decl rax_eid(eid:number)
+rax_eid(eid) :- get_loc_vex_exp("rax", eid).
+
+// holds_heap_ptr(func, eid, callSite): eid 持有 callSite 处 malloc 返回的指针
+.decl holds_heap_ptr(func:symbol, eid:number, callSite:number)
+
+// 基础：callSite 之后的指令中第一条 rax 写入（在同一函数内）
+holds_heap_ptr(func, regEid, callSite) :-
+    heap_alloc_call(func, callSite, _, _),
+    filter_set_loc_vex(func, _, instrAddr, _, _, dataEid, regEid),
+    rax_eid(dataEid),
+    instrAddr > callSite.
+
+// 传播：t2 = t1
+holds_heap_ptr(func, dst, callSite) :-
+    holds_heap_ptr(func, src, callSite),
+    filter_set_loc_vex(func, _, _, _, _, src, dst),
+    src != dst.
+
+// ── Step 3: 映射堆 load/store 到 A-loc ───────────────────────────────────────
+
+.decl store_to_heap_aloc(instrAddr:number, valueEid:number, alocId:symbol)
+store_to_heap_aloc(instrAddr, valueEid, alocId) :-
+    filter_set_mem_vex(func, _, instrAddr, _, _, valueEid, addrEid),
+    holds_heap_ptr(func, addrEid, callSite),
+    heap_aloc(alocId, func, callSite, _).
+
+.decl load_from_heap_aloc(instrAddr:number, resultEid:number, alocId:symbol)
+load_from_heap_aloc(instrAddr, resultEid, alocId) :-
+    filter_get_mem_vex_exp(func, _, instrAddr, _, _, _, addrEid),
+    holds_heap_ptr(func, addrEid, callSite),
+    heap_aloc(alocId, func, callSite, _),
+    filter_set_loc_vex(func, _, instrAddr, _, _, _, resultEid).
+
+// ── 输出 ──────────────────────────────────────────────────────────────────────
+
+.output heap_boundary(filename="heap_boundary.facts")
+.output heap_aloc(filename="heap_aloc.facts")
+.output store_to_heap_aloc(filename="store_to_heap_aloc.facts")
+.output load_from_heap_aloc(filename="load_from_heap_aloc.facts")

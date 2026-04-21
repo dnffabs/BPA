@@ -1,0 +1,185 @@
+// aloc_gen.dl — A-loc 生成 + 内存访问映射（BPA-X 算法）
+//
+// Step 1: 为每个内存块生成唯一 A-loc ID
+// Step 2: 追踪持有栈偏移的临时变量（holds_stack_offset）
+// Step 3: 追踪持有全局地址的临时变量（holds_global_addr）
+// Step 4: 将 load/store 映射到对应 A-loc
+//
+// 输入: stack_boundary, global_boundary,
+//        filter_set_loc_vex, filter_set_mem_vex, filter_get_mem_vex_exp,
+//        filter_binop_vex_exp, get_loc_vex_exp, imm_as_signed
+// 输出: stack_aloc, global_aloc, store_to_aloc, load_from_aloc
+
+// ── 输入声明 ──────────────────────────────────────────────────────────────────
+
+.decl stack_boundary(func:symbol, offset:number, size:number)
+.input stack_boundary(filename="stack_boundary.facts")
+
+.decl global_boundary(addr:number, size:number)
+.input global_boundary(filename="global_boundary.facts")
+
+.decl filter_set_loc_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+.input filter_set_loc_vex
+
+.decl filter_set_mem_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, addrEid:number)
+.input filter_set_mem_vex
+
+.decl filter_get_mem_vex_exp(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:symbol, addrEid:number)
+.input filter_get_mem_vex_exp
+
+.decl filter_binop_vex_exp(addr:number, op:symbol, arg1Eid:number, arg2Eid:number, resultEid:number)
+.input filter_binop_vex_exp
+
+.decl get_loc_vex_exp(regName:symbol, regEid:number)
+.input get_loc_vex_exp
+
+.decl imm_as_signed(conEid:number, signedVal:number)
+.input imm_as_signed(filename="imm_signed.facts")
+
+.decl filtered_func(func:symbol, start_addr:number, end_addr:number)
+.input filtered_func
+
+// ── Step 1: 生成 A-loc ────────────────────────────────────────────────────────
+
+// 栈 A-loc：每个 (func, offset) 对应唯一 ID
+.decl stack_aloc(alocId:symbol, func:symbol, offset:number, size:number)
+stack_aloc(cat("stk_", cat(func, cat("_", to_string(offset)))), func, offset, size) :-
+    stack_boundary(func, offset, size).
+
+// 全局 A-loc：每个 addr 对应唯一 ID
+.decl global_aloc(alocId:symbol, addr:number, size:number)
+global_aloc(cat("glb_", to_string(addr)), addr, size) :-
+    global_boundary(addr, size).
+
+// ── Step 2: 追踪持有 RSP/RBP 值的临时变量（传递闭包）────────────────────────
+
+.decl stack_reg_eid(regEid:number)
+stack_reg_eid(eid) :- get_loc_vex_exp("rsp", eid).
+stack_reg_eid(eid) :- get_loc_vex_exp("rbp", eid).
+stack_reg_eid(eid) :- get_loc_vex_exp("esp", eid).
+stack_reg_eid(eid) :- get_loc_vex_exp("ebp", eid).
+
+.decl holds_stack_ptr(func:symbol, eid:number)
+holds_stack_ptr(func, eid) :-
+    filter_set_loc_vex(func, _, _, _, _, dataEid, eid),
+    stack_reg_eid(dataEid).
+holds_stack_ptr(func, dst) :-
+    holds_stack_ptr(func, src),
+    filter_set_loc_vex(func, _, _, _, _, src, dst),
+    src != dst.
+
+// ── Step 3: 计算 holds_stack_offset(func, addrEid, offset) ───────────────────
+// addrEid 持有 rsp + offset 的值
+
+.decl holds_stack_offset(func:symbol, addrEid:number, offset:number)
+
+// 直接 binop: addrEid = rsp ± imm（tmp 在 arg1）
+holds_stack_offset(func, resultEid, -immVal) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, tmpEid, immEid, resultEid),
+    (op = "Sub64" ; op = "Sub32"),
+    imm_as_signed(immEid, immVal), immVal > 0,
+    filtered_func(func, start, end), addr >= start, addr <= end.
+
+holds_stack_offset(func, resultEid, immVal) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, tmpEid, immEid, resultEid),
+    (op = "Add64" ; op = "Add32"),
+    imm_as_signed(immEid, immVal),
+    filtered_func(func, start, end), addr >= start, addr <= end.
+
+// 对称：imm 在 arg1（Add 可交换）
+holds_stack_offset(func, resultEid, immVal) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, immEid, tmpEid, resultEid),
+    (op = "Add64" ; op = "Add32"),
+    imm_as_signed(immEid, immVal),
+    filtered_func(func, start, end), addr >= start, addr <= end.
+
+// 传播：t2 = t1（t1 已持有某偏移）
+holds_stack_offset(func, dst, offset) :-
+    holds_stack_offset(func, src, offset),
+    filter_set_loc_vex(func, _, _, _, _, src, dst),
+    src != dst.
+
+// ── Step 4: 追踪持有全局地址的临时变量 ───────────────────────────────────────
+// holds_global_addr(addrEid, addr): addrEid 持有全局地址 addr
+
+.decl holds_global_addr(addrEid:number, addr:number)
+
+// 直接常量：addrEid 来自立即数，且该立即数是全局地址
+// 注意：imm_as_signed 只保留 abs < 65536 的值，全局地址通常更大
+// 因此从 global_addr_candidates.facts 读取（由 extract_global_addrs.py 生成）
+// imm_global_eid.facts 由 extract_imm_global_eid.py 预处理生成（避免 to_number 溢出）
+// 格式: conEid  addr
+.decl imm_global_eid(conEid:number, addr:number)
+.input imm_global_eid(filename="imm_global_eid.facts")
+
+// 直接赋值：t = imm（imm 是全局地址）
+holds_global_addr(regEid, addr) :-
+    filter_set_loc_vex(_, _, _, _, _, dataEid, regEid),
+    imm_global_eid(dataEid, addr).
+
+// 传播：t2 = t1
+holds_global_addr(dst, addr) :-
+    holds_global_addr(src, addr),
+    filter_set_loc_vex(_, _, _, _, _, src, dst),
+    src != dst.
+
+// ── Step 5: 映射 store 到 A-loc ───────────────────────────────────────────────
+// store_to_aloc(instrAddr, valueEid, alocId)
+// 优先栈，其次全局；禁止同一访问映射多个 A-loc
+
+.decl store_is_stack(instrAddr:number, valueEid:number, alocId:symbol)
+store_is_stack(instrAddr, valueEid, alocId) :-
+    filter_set_mem_vex(func, _, instrAddr, _, _, valueEid, addrEid),
+    holds_stack_offset(func, addrEid, offset),
+    stack_aloc(alocId, func, offset, _).
+
+.decl store_is_global(instrAddr:number, valueEid:number, alocId:symbol)
+store_is_global(instrAddr, valueEid, alocId) :-
+    filter_set_mem_vex(_, _, instrAddr, _, _, valueEid, addrEid),
+    holds_global_addr(addrEid, addr),
+    global_aloc(alocId, addr, _).
+
+.decl store_to_aloc(instrAddr:number, valueEid:number, alocId:symbol)
+// 栈优先
+store_to_aloc(instrAddr, valueEid, alocId) :-
+    store_is_stack(instrAddr, valueEid, alocId).
+// 全局：仅当该访问未被识别为栈访问
+store_to_aloc(instrAddr, valueEid, alocId) :-
+    store_is_global(instrAddr, valueEid, alocId),
+    !store_is_stack(instrAddr, valueEid, _).
+
+// ── Step 6: 映射 load 到 A-loc ────────────────────────────────────────────────
+// load_from_aloc(instrAddr, resultEid, alocId)
+// filter_get_mem_vex_exp: (func, irsbAddr, instrAddr, irOrder, size, dataEid:symbol, addrEid:number)
+
+.decl load_is_stack(instrAddr:number, resultEid:number, alocId:symbol)
+load_is_stack(instrAddr, resultEid, alocId) :-
+    filter_get_mem_vex_exp(func, _, instrAddr, _, _, _, addrEid),
+    holds_stack_offset(func, addrEid, offset),
+    stack_aloc(alocId, func, offset, _),
+    // resultEid: 找到同一指令中 load 结果写入的寄存器
+    filter_set_loc_vex(func, _, instrAddr, _, _, _, resultEid).
+
+.decl load_is_global(instrAddr:number, resultEid:number, alocId:symbol)
+load_is_global(instrAddr, resultEid, alocId) :-
+    filter_get_mem_vex_exp(_, _, instrAddr, _, _, _, addrEid),
+    holds_global_addr(addrEid, addr),
+    global_aloc(alocId, addr, _),
+    filter_set_loc_vex(_, _, instrAddr, _, _, _, resultEid).
+
+.decl load_from_aloc(instrAddr:number, resultEid:number, alocId:symbol)
+load_from_aloc(instrAddr, resultEid, alocId) :-
+    load_is_stack(instrAddr, resultEid, alocId).
+load_from_aloc(instrAddr, resultEid, alocId) :-
+    load_is_global(instrAddr, resultEid, alocId),
+    !load_is_stack(instrAddr, resultEid, _).
+
+// ── 输出 ──────────────────────────────────────────────────────────────────────
+
+.output stack_aloc(filename="stack_aloc.facts")
+.output global_aloc(filename="global_aloc.facts")
+.output store_to_aloc(filename="store_to_aloc.facts")
+.output load_from_aloc(filename="load_from_aloc.facts")

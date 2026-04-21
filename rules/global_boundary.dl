@@ -1,0 +1,85 @@
+// global_boundary.dl — 全局内存块边界识别（BPA-X 算法）
+//
+// 算法：
+//   1. 读取预处理好的全局地址候选（由 extract_global_addrs.py 生成）
+//   2. 读取段范围，确定每个候选属于哪个段
+//   3. 相邻候选之间的间距即为该内存块的 size
+//   4. 过滤内部地址（addr 落在另一个 addr 的范围内则删除）
+//
+// 输入: data.facts, bss.facts, rodata.facts, global_addr_candidates.facts
+// 输出: global_boundary(addr, size)
+
+// ── 输入声明 ──────────────────────────────────────────────────────────────────
+
+.decl data_section(start:number, end:number, sz:number)
+.input data_section(filename="data.facts")
+
+.decl bss_section(start:number, end:number, sz:number)
+.input bss_section(filename="bss.facts")
+
+.decl rodata_section(start:number, end:number, sz:number)
+.input rodata_section(filename="rodata.facts")
+
+// 由 extract_global_addrs.py 预处理生成，每行一个十进制地址
+.decl global_addr_candidates(addr:number)
+.input global_addr_candidates(filename="global_addr_candidates.facts")
+
+// ── Step 1: 定义全局区间（仅 .data 和 .bss，排除 .rodata 字符串常量）────────
+
+.decl global_region(start:number, end:number)
+global_region(start, end) :- data_section(start, end, _).
+global_region(start, end) :- bss_section(start, end, _).
+
+// ── Step 2: 关联候选地址到所属区间，并强制加入段起始地址 ─────────────────────
+// 旧 BPA: global_value_bound(low) 确保段起始地址始终是边界候选
+
+.decl global_candidate(addr:number, rgn_end:number)
+global_candidate(addr, end) :-
+    global_addr_candidates(addr),
+    global_region(start, end),
+    addr >= start, addr < end.
+
+// 段起始地址强制加入（即使代码中没有引用该地址的立即数）
+global_candidate(start, end) :-
+    global_region(start, end).
+
+// ── Step 3: 用 min 聚合找每个候选的下一个地址 ────────────────────────────────
+
+.decl next_candidate(addr:number, next_addr:number)
+next_candidate(addr, next_addr) :-
+    global_candidate(addr, end),
+    next_addr = min n : { global_candidate(n, end), n > addr }.
+
+// ── Step 4: 生成候选全局边界 ─────────────────────────────────────────────────
+
+.decl global_boundary_candidate(addr:number, size:number)
+
+// 有下一个候选：size = next - current
+global_boundary_candidate(addr, next_addr - addr) :-
+    global_candidate(addr, _),
+    next_candidate(addr, next_addr).
+
+// 最后一个候选（无下一个）：size = rgn_end - addr
+global_boundary_candidate(addr, end - addr) :-
+    global_candidate(addr, end),
+    !next_candidate(addr, _).
+
+// ── Step 5: 过滤内部地址 ─────────────────────────────────────────────────────
+// 若 addr2 落在 [addr1, addr1+size1) 且 addr2 != addr1 → 删除 addr2
+
+.decl is_inner_addr(addr:number)
+is_inner_addr(addr2) :-
+    global_boundary_candidate(addr1, size1),
+    global_boundary_candidate(addr2, _),
+    addr2 != addr1,
+    addr2 >= addr1,
+    addr2 < addr1 + size1.
+
+// ── 最终输出 ──────────────────────────────────────────────────────────────────
+
+.decl global_boundary(addr:number, size:number)
+global_boundary(addr, size) :-
+    global_boundary_candidate(addr, size),
+    !is_inner_addr(addr).
+
+.output global_boundary(filename="global_boundary.facts")
