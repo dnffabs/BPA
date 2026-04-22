@@ -1,0 +1,181 @@
+// stack_boundary_debug.dl — 诊断版：输出所有中间关系
+//
+// 基于 stack_boundary.dl，添加所有中间关系的 .output 指令
+// 用于追踪 simple_test 的栈边界生成路径，分析精度/召回率低的原因
+
+// ── 输入声明 ──────────────────────────────────────────────────────────────────
+
+.decl filter_set_loc_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
+.input filter_set_loc_vex
+
+.decl filter_set_mem_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, addrEid:number)
+.input filter_set_mem_vex
+
+.decl filter_get_mem_vex_exp(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:symbol, tmpEid:number)
+.input filter_get_mem_vex_exp
+
+.decl filter_binop_vex_exp(addr:number, op:symbol, arg1Eid:number, arg2Eid:number, resultEid:number)
+.input filter_binop_vex_exp
+
+.decl get_loc_vex_exp(regName:symbol, regEid:number)
+.input get_loc_vex_exp
+
+.decl filtered_func(func:symbol, start_addr:number, end_addr:number)
+.input filtered_func
+
+// ── Step 1: 识别 RSP/RBP 寄存器 EID ─────────────────────────────────────────
+
+.decl stack_reg_eid(regEid:number)
+stack_reg_eid(eid) :- get_loc_vex_exp("rsp", eid).
+stack_reg_eid(eid) :- get_loc_vex_exp("rbp", eid).
+stack_reg_eid(eid) :- get_loc_vex_exp("esp", eid).
+stack_reg_eid(eid) :- get_loc_vex_exp("ebp", eid).
+
+.output stack_reg_eid(filename="debug_stack_reg_eid.facts")
+
+// ── Step 2: 追踪持有 RSP/RBP 值的临时变量（传递闭包）────────────────────────
+
+.decl holds_stack_ptr(func:symbol, tmpEid:number)
+// 基础: t = GET(rsp/rbp)
+holds_stack_ptr(func, tmpEid) :-
+    filter_set_loc_vex(func, _, _, _, _, dataEid, tmpEid),
+    stack_reg_eid(dataEid).
+// 传递: t2 = t1（t1 已持有栈指针值）
+holds_stack_ptr(func, dst) :-
+    holds_stack_ptr(func, src),
+    filter_set_loc_vex(func, _, _, _, _, src, dst),
+    src != dst.
+
+.output holds_stack_ptr(filename="debug_holds_stack_ptr.facts")
+
+// ── Step 3: 立即数（有符号）────────────────────────────────────────────────
+
+.decl imm_as_signed(conEid:number, signedVal:number)
+.input imm_as_signed(filename="imm_signed.facts")
+
+.output imm_as_signed(filename="debug_imm_as_signed.facts")
+
+// ── Step 4: 找 binop(tmp, imm) → 栈偏移 ─────────────────────────────────────
+
+.decl stack_arith(func:symbol, addr:number, op:symbol, immVal:number, resultEid:number)
+
+// tmp 在 arg1: result = tmp OP imm
+stack_arith(func, addr, op, immVal, resultEid) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, tmpEid, immEid, resultEid),
+    (op = "Sub64" ; op = "Sub32" ; op = "Add64" ; op = "Add32"),
+    imm_as_signed(immEid, immVal),
+    filtered_func(func, start, end),
+    addr >= start, addr <= end.
+
+// tmp 在 arg2: result = imm OP tmp（Add 可交换）
+stack_arith(func, addr, op, immVal, resultEid) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, immEid, tmpEid, resultEid),
+    (op = "Add64" ; op = "Add32"),
+    imm_as_signed(immEid, immVal),
+    filtered_func(func, start, end),
+    addr >= start, addr <= end.
+
+.output stack_arith(filename="debug_stack_arith.facts")
+
+// ── Step 5: 计算有符号偏移 ───────────────────────────────────────────────────
+
+.decl stack_offset_signed(func:symbol, offset:number, resultEid:number)
+
+// Sub: offset = -immVal
+stack_offset_signed(func, -immVal, resultEid) :-
+    stack_arith(func, _, op, immVal, resultEid),
+    (op = "Sub64" ; op = "Sub32"),
+    immVal > 0.
+
+// Add 正数: offset = +immVal
+stack_offset_signed(func, immVal, resultEid) :-
+    stack_arith(func, _, op, immVal, resultEid),
+    (op = "Add64" ; op = "Add32"),
+    immVal > 0.
+
+// Add 负数: offset = immVal（已是负数）
+stack_offset_signed(func, immVal, resultEid) :-
+    stack_arith(func, _, op, immVal, resultEid),
+    (op = "Add64" ; op = "Add32"),
+    immVal < 0.
+
+.output stack_offset_signed(filename="debug_stack_offset_signed.facts")
+
+// ── Step 6: 追踪地址传播 ─────────────────────────────────────────────────────
+
+.decl addr_propagate(func:symbol, srcEid:number, dstEid:number)
+addr_propagate(func, eid, eid) :-
+    stack_offset_signed(func, _, eid).
+addr_propagate(func, srcEid, dstEid) :-
+    addr_propagate(func, srcEid, midEid),
+    filter_set_loc_vex(func, _, _, _, _, midEid, dstEid),
+    srcEid != dstEid.
+
+.output addr_propagate(filename="debug_addr_propagate.facts")
+
+// ── Step 7: 识别被 load/store 使用的偏移 ─────────────────────────────────────
+
+.decl used_as_mem_addr(func:symbol, srcEid:number, accessSize:number)
+
+// store
+used_as_mem_addr(func, srcEid, size) :-
+    addr_propagate(func, srcEid, addrEid),
+    filter_set_mem_vex(func, _, _, _, size, _, addrEid).
+
+// load
+used_as_mem_addr(func, srcEid, size) :-
+    addr_propagate(func, srcEid, addrEid),
+    filter_get_mem_vex_exp(func, _, _, _, size, _, addrEid).
+
+.output used_as_mem_addr(filename="debug_used_as_mem_addr.facts")
+
+// ── Step 8: 生成候选栈边界 ───────────────────────────────────────────────────
+
+.decl stack_boundary_candidate(func:symbol, offset:number, size:number)
+
+// 局部变量: offset <= 0 且被 load/store 使用
+stack_boundary_candidate(func, offset, size) :-
+    stack_offset_signed(func, offset, resultEid),
+    offset <= 0,
+    used_as_mem_addr(func, resultEid, size),
+    size > 0.
+
+// 函数序言: rsp = rsp - imm
+stack_boundary_candidate(func, offset, 8) :-
+    stack_offset_signed(func, offset, resultEid),
+    offset < 0,
+    filter_set_loc_vex(func, _, _, _, _, resultEid, regEid),
+    stack_reg_eid(regEid).
+
+// 参数: offset > 0
+stack_boundary_candidate(func, offset, size) :-
+    stack_offset_signed(func, offset, resultEid),
+    offset > 0, offset < 1024,
+    used_as_mem_addr(func, resultEid, size),
+    size > 0.
+
+.output stack_boundary_candidate(filename="debug_stack_boundary_candidate.facts")
+
+// ── Step 9: 过滤内部地址 ─────────────────────────────────────────────────────
+
+.decl is_inner_offset(func:symbol, offset:number)
+is_inner_offset(func, offset2) :-
+    stack_boundary_candidate(func, offset1, size1),
+    stack_boundary_candidate(func, offset2, _),
+    offset2 != offset1,
+    offset2 >= offset1,
+    offset2 < offset1 + size1.
+
+.output is_inner_offset(filename="debug_is_inner_offset.facts")
+
+// ── 最终输出 ─────────────────────────────────────────────────────────────────
+
+.decl stack_boundary(func:symbol, offset:number, size:number)
+stack_boundary(func, offset, size) :-
+    stack_boundary_candidate(func, offset, size),
+    !is_inner_offset(func, offset),
+    size = max s : stack_boundary_candidate(func, offset, s).
+
+.output stack_boundary(filename="debug_stack_boundary.facts")

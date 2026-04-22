@@ -53,6 +53,38 @@ def metrics(pred: set, gt: set):
     return tp, fp, fn, precision, recall, f1
 
 
+def metrics_stack_offset(pred_set, gt_set):
+    """
+    Stack variable matching by (func, offset), tolerating size differences.
+    Prediction can only observe access size, which may be smaller than the
+    full variable size reported by DWARF.  A predicted (func, offset, ps)
+    is TP if there exists a GT (func, offset, gs) with ps <= gs.
+    """
+    # Build lookup: (func, offset) -> max size
+    gt_by_key = {}
+    for func, off, sz in gt_set:
+        key = (func, off)
+        gt_by_key[key] = max(gt_by_key.get(key, 0), sz)
+
+    pred_by_key = {}
+    for func, off, sz in pred_set:
+        key = (func, off)
+        pred_by_key[key] = max(pred_by_key.get(key, 0), sz)
+
+    tp_keys = set()
+    for key, psz in pred_by_key.items():
+        if key in gt_by_key and psz <= gt_by_key[key]:
+            tp_keys.add(key)
+
+    tp = len(tp_keys)
+    fp = len(pred_by_key) - tp
+    fn = len(gt_by_key) - len(tp_keys & set(gt_by_key.keys()))
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return tp, fp, fn, precision, recall, f1, gt_by_key, pred_by_key, tp_keys
+
+
 def metrics_global_overlap(pred_list, gt_list):
     """
     Global variable matching by interval overlap instead of exact match.
@@ -83,7 +115,7 @@ def metrics_global_overlap(pred_list, gt_list):
     return tp, fp, fn, precision, recall, f1
 
 
-def report(name, pred, gt, out=None, use_overlap=False):
+def report(name, pred, gt, out=None, use_overlap=False, use_stack_offset=False):
     def w(line=''):
         print(line)
         if out:
@@ -93,6 +125,26 @@ def report(name, pred, gt, out=None, use_overlap=False):
         gt_list   = sorted(gt)
         tp, fp, fn, p, r, f1 = metrics_global_overlap(pred_list, gt_list)
         w(f"\n=== {name} (interval-overlap matching) ===")
+    elif use_stack_offset:
+        tp, fp, fn, p, r, f1, gt_by_key, pred_by_key, tp_keys = metrics_stack_offset(pred, gt)
+        w(f"\n=== {name} (offset matching, size tolerant) ===")
+        w(f"  GT entries   : {len(gt_by_key)}")
+        w(f"  Pred entries : {len(pred_by_key)}")
+        w(f"  TP={tp}  FP={fp}  FN={fn}")
+        w(f"  Precision : {p:.4f}")
+        w(f"  Recall    : {r:.4f}")
+        w(f"  F1        : {f1:.4f}")
+        fn_keys = set(gt_by_key.keys()) - tp_keys
+        fp_keys = set(pred_by_key.keys()) - tp_keys
+        if fn_keys:
+            w("  Missing (in GT but not predicted):")
+            for key in sorted(fn_keys):
+                w(f"    {key}  size={gt_by_key[key]}")
+        if fp_keys:
+            w("  Extra (predicted but not in GT):")
+            for key in sorted(fp_keys):
+                w(f"    {key}  size={pred_by_key[key]}")
+        return
     else:
         tp, fp, fn, p, r, f1 = metrics(pred, gt)
         w(f"\n=== {name} ===")
@@ -146,7 +198,8 @@ def main():
     with open(result_file, 'w') as out:
         header = f"Binary: {binary}\nTime: {datetime.now().isoformat()}\n"
         print(header); out.write(header + '\n')
-        report("Local Variables (stack)", pred_stack, gt_stack, out)
+        report("Local Variables (stack) — exact", pred_stack, gt_stack, out)
+        report("Local Variables (stack) — offset match", pred_stack, gt_stack, out, use_stack_offset=True)
         report("Global Variables",        pred_global, gt_global, out, use_overlap=True)
 
     print(f"\n[compare] 结果已保存至: {result_file}")

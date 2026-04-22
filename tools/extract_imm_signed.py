@@ -8,7 +8,9 @@ import argparse
 import ctypes
 
 
-def to_signed64(val: int) -> int:
+def to_signed(val: int, bits: int) -> int:
+    if bits == 32:
+        return ctypes.c_int32(val).value
     return ctypes.c_int64(val).value
 
 
@@ -24,12 +26,13 @@ def main():
             parts = line.strip().split()
             if len(parts) < 3:
                 continue
-            val_str, con_eid = parts[1], parts[2]
+            sz_str, val_str, con_eid = parts[0], parts[1], parts[2]
             try:
+                sz = int(sz_str)
                 val = int(val_str)
             except ValueError:
                 continue
-            signed = to_signed64(val)
+            signed = to_signed(val, sz)
             if abs(signed) < 65536 and signed != 0:
                 results.append(f"{con_eid}\t{signed}")
 

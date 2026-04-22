@@ -91,9 +91,11 @@ def extract_local_offset(die, loc_parser, location_lists, dwarfinfo, CU, arch):
             if val is None:
                 continue
             if reg == 'DW_OP_fbreg':
-                return val, size
+                # fbreg X = CFA + X = ebp + 2*ptr + X → convert to ebp-relative
+                return val + 2 * ptr, size
             if reg in ('rbp', 'ebp'):
-                return val + ptr, size
+                # already ebp/rbp-relative, return as-is
+                return val, size
     return None
 
 

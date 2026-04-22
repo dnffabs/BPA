@@ -52,6 +52,19 @@ holds_stack_ptr(func, dst) :-
     holds_stack_ptr(func, src),
     filter_set_loc_vex(func, _, _, _, _, src, dst),
     src != dst.
+// 传递: result = Add/Sub(stackptr, imm) → result 也持有栈指针派生值
+holds_stack_ptr(func, resultEid) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, tmpEid, _, resultEid),
+    (op = "Add32" ; op = "Add64" ; op = "Sub32" ; op = "Sub64"),
+    filtered_func(func, start, end),
+    addr >= start, addr < end.
+holds_stack_ptr(func, resultEid) :-
+    holds_stack_ptr(func, tmpEid),
+    filter_binop_vex_exp(addr, op, _, tmpEid, resultEid),
+    (op = "Add32" ; op = "Add64"),
+    filtered_func(func, start, end),
+    addr >= start, addr < end.
 
 // ── Step 3: 立即数（有符号，由 extract_imm_signed.py 预处理）────────────────
 // 修复3: 64 位补码负数由 Python 工具转换，避免 Soufflé to_number 溢出
@@ -72,7 +85,7 @@ stack_arith(func, addr, op, immVal, resultEid) :-
     (op = "Sub64" ; op = "Sub32" ; op = "Add64" ; op = "Add32"),
     imm_as_signed(immEid, immVal),
     filtered_func(func, start, end),
-    addr >= start, addr <= end.
+    addr >= start, addr < end.
 
 // tmp 在 arg2: result = imm OP tmp（Add 可交换，Sub 不常见但也处理）
 stack_arith(func, addr, op, immVal, resultEid) :-
@@ -81,7 +94,7 @@ stack_arith(func, addr, op, immVal, resultEid) :-
     (op = "Add64" ; op = "Add32"),
     imm_as_signed(immEid, immVal),
     filtered_func(func, start, end),
-    addr >= start, addr <= end.
+    addr >= start, addr < end.
 
 // ── Step 5: 计算有符号偏移 ───────────────────────────────────────────────────
 // Sub → offset = -|imm|（局部变量方向）
@@ -133,6 +146,16 @@ used_as_mem_addr(func, srcEid, size) :-
     addr_propagate(func, srcEid, addrEid),
     filter_get_mem_vex_exp(func, _, _, _, size, _, addrEid).
 
+// 同指令地址匹配: 当 binop 结果 EID 与 load/store 地址 EID 不一致时
+// （fact 提取工具的 EID 映射问题），通过指令地址关联
+used_as_mem_addr(func, resultEid, size) :-
+    stack_arith(func, addr, _, _, resultEid),
+    filter_get_mem_vex_exp(func, _, addr, _, size, _, _).
+
+used_as_mem_addr(func, resultEid, size) :-
+    stack_arith(func, addr, _, _, resultEid),
+    filter_set_mem_vex(func, _, addr, _, size, _, _).
+
 // ── Step 8: 生成候选栈边界 ───────────────────────────────────────────────────
 
 .decl stack_boundary_candidate(func:symbol, offset:number, size:number)
@@ -158,7 +181,7 @@ stack_boundary_candidate(func, offset, size) :-
     used_as_mem_addr(func, resultEid, size),
     size > 0.
 
-// ── Step 9: 过滤内部地址 ─────────────────────────────────────────────────────
+// ── Step 9: 过滤内部地址和序言伪边界 ────────────────────────────────────────
 // 栈 offset 是负数，区间 [offset, offset+size) 向正方向延伸
 // 若 offset2 落在 [offset1, offset1+size1) 内且不等于 offset1 → 是内部地址
 
@@ -170,12 +193,20 @@ is_inner_offset(func, offset2) :-
     offset2 >= offset1,
     offset2 < offset1 + size1.
 
+// 过滤序言/尾声产生的伪边界:
+// offset=4 (32位 saved ebp 上方，不是变量)
+// offset=1 (Sub32(esp,4) 后 Add32(result,1) 的噪声)
+.decl is_prologue_offset(func:symbol, offset:number)
+is_prologue_offset(func, 4) :- stack_boundary_candidate(func, 4, _).
+is_prologue_offset(func, 1) :- stack_boundary_candidate(func, 1, _).
+
 // ── 最终输出：对同一 (func, offset) 取最大 size ───────────────────────────────
 
 .decl stack_boundary(func:symbol, offset:number, size:number)
 stack_boundary(func, offset, size) :-
     stack_boundary_candidate(func, offset, size),
     !is_inner_offset(func, offset),
+    !is_prologue_offset(func, offset),
     size = max s : stack_boundary_candidate(func, offset, s).
 
 .output stack_boundary(filename="stack_boundary.facts")
