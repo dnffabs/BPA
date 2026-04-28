@@ -1,0 +1,13 @@
+# Core analysis dependencies
+angr
+pyelftools
+
+# Compare / evaluation dependencies
+networkx
+matplotlib
+psutil
+
+# Imported directly by compare tools
+capstone
+claripy
+pyvex
