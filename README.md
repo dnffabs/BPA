@@ -4,7 +4,7 @@
 
 项目采用 BPA / BPA-X 的内存块分析思路，提供可运行、可检查、可回归的基础流程。当前版本使用 **facts schema v2**，Python 环境与依赖由 **uv** 管理。
 
-[环境要求](#环境要求) · [快速开始](#快速开始) · [项目结构](#项目结构) · [使用方法](#使用方法) · [输出说明](#输出说明) · [回归测试](#回归测试) · [当前限制](#当前限制)
+[环境要求](#环境要求) · [快速开始](#快速开始) · [算法逐步推导](docs/ALGORITHM_WALKTHROUGH.md) · [项目结构](#项目结构) · [使用方法](#使用方法) · [输出说明](#输出说明) · [回归测试](#回归测试) · [当前限制](#当前限制)
 
 ## 功能概览
 
@@ -175,9 +175,10 @@ BPA/
 │   ├── fixtures/                     # 各分析能力的 C 样例
 │   └── run_regressions.py            # 语义与原生流程回归
 ├── docs/
+│   ├── ALGORITHM_WALKTHROUGH.md       # 从分块到调用目标的样例推导与实测
 │   ├── FACTS.md                      # facts 字段与语义
 │   ├── REQUIREMENTS.md               # 环境配置与故障排查
-│   └── REPAIR_VALIDATION.md           # 基线修复与验证记录
+│   └── examples/callback_walkthrough.c # 基础回调及覆盖赋值对照样例
 └── build/                            # 编译产物、facts、日志与评估；不提交
 ```
 
@@ -268,7 +269,7 @@ uv run --locked python tests/run_regressions.py
 
 回归会实际编译、运行并分析 x86 / x64 样例，同时覆盖 AMD64 PIE。测试内容包括寄存器覆盖赋值、临时变量隔离、块内先读后写、偏移累计、内存别名、参数与返回值、间接工厂调用、全局初始化指针、堆回调、分支循环、PLT 和错误输入处理。
 
-逐案例结果保存到 `build/regressions/results.json`。寄存器与单参数回调案例检查目标集合精确相等；保守内存案例检查预期目标均被找到，并单独统计额外候选。详细基线记录见 [修复与验证记录](docs/REPAIR_VALIDATION.md)。
+逐案例结果保存到 `build/regressions/results.json`。寄存器与单参数回调案例检查目标集合精确相等；保守内存案例检查预期目标均被找到，并单独统计额外候选。若要理解传播过程与额外候选的来源，可阅读 [算法逐步推导](docs/ALGORITHM_WALKTHROUGH.md) 并运行其中的两个教学样例。
 
 ## 使用 uv 管理环境
 
@@ -312,7 +313,7 @@ uv export --locked --no-hashes --no-emit-project \
 
 ## 进一步阅读
 
+- [从内存分块到间接调用目标：算法逐步推导](docs/ALGORITHM_WALKTHROUGH.md)
 - [环境配置与故障排查](docs/REQUIREMENTS.md)
 - [Facts schema v2](docs/FACTS.md)
-- [基线修复与验证记录](docs/REPAIR_VALIDATION.md)
 - [angr](https://angr.io/) · [Soufflé](https://souffle-lang.github.io/) · [uv](https://docs.astral.sh/uv/)
