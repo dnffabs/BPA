@@ -18,8 +18,9 @@ def extract_and_convert_functions(binary_path, output_file="addr_func.facts"):
         symtab = elf.get_section_by_name('.symtab')
 
         if not symtab:
-            print("错误：未找到 .symtab 节")
-            return
+            from pathlib import Path
+            Path(output_file).unlink(missing_ok=True)
+            raise SystemExit("错误：未找到 .symtab 节；stripped 函数恢复尚未实现")
 
         # 收集函数信息
         functions = [

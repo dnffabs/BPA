@@ -1,21 +1,9 @@
-#!/bin/bash
-# compare.sh — 对比实验：提取 DWARF GT 并计算 Precision/Recall/F1
-# 用法: ./compare.sh <binary_file> <base_dir>
-set -e
-
-BINARY_FILE="$(realpath "$1")"
-BASE_DIR="$2"
-FACTS_DIR="$BASE_DIR/facts"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMPARE_DIR="$SCRIPT_DIR/../compare"
-
-echo "========================================="
-echo "[compare] 开始对比实验"
-echo "[compare] 二进制: $BINARY_FILE"
-echo "[compare] facts 目录: $FACTS_DIR"
-echo "========================================="
-
-python3 "$COMPARE_DIR/evaluate.py" \
-    "$BINARY_FILE" \
-    "$FACTS_DIR/stack_boundary.facts" \
-    "$FACTS_DIR/global_boundary.facts"
+#!/usr/bin/env bash
+# Run all prerequisites through compare; usage: compare.sh <ELF> <output-dir>
+set -euo pipefail
+source "$(dirname "$0")/common.sh"
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <ELF> <output-dir>" >&2
+    exit 2
+fi
+exec "$PYTHON" "$ROOT_DIR/tools/run_pipeline.py" "$1" --output "$2" --stage compare

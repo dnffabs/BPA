@@ -1,155 +1,141 @@
-// analysis.dl — 值集分析（BPA-X 阶段五）
-//
-// 论文 Section D：
-//   - 流不敏感（SSA 已编码控制流）
-//   - 值集 = {函数起始地址} ∪ {A-loc 基地址}
-//   - 追踪 SSA 寄存器 + VEX 临时寄存器
-//   - Soufflé 递归规则自动完成不动点迭代
-//   - 最终解析间接调用目标（PUT(rip) = t → t 的值集中的函数地址）
-//
-// 输入: filter_set_loc_vex, filter_set_mem_vex, filter_get_mem_vex_exp,
-//        filter_binop_vex_exp, call_site_raw,
-//        filtered_func, stack_aloc, global_aloc, heap_aloc,
-//        ssa_def, reaching_def_exit, get_loc_vex_exp
-// 输出: value_set, indirect_call_target
+// Joint interprocedural points-to / call-graph least fixed point.
+#include "schema.dl"
+.decl def_use(source:number, dest:number)
+.input def_use
+.decl exit_reg(func:symbol, reg:number, version:number)
+.input exit_reg
+.decl scalar(eid:number, value:number)
+.input scalar
+.decl stack_aloc(id:symbol, func:symbol, offset:number, size:number)
+.input stack_aloc
+.decl global_aloc(id:symbol, addr:number, size:number)
+.input global_aloc
+.decl heap_aloc(id:symbol, func:symbol, site:number, size:number)
+.input heap_aloc
+.decl pointer_seed(eid:number, block:symbol)
+.input pointer_seed
+.decl heap_result(call_stmt:number, eid:number, block:symbol)
+.input heap_result
+.decl pointer_width(bits:number)
+.input pointer_width
+.decl abi_sp(reg:number)
+.input abi_sp
+.decl abi_return(reg:number)
+.input abi_return
+.decl abi_first_arg(reg:number)
+.input abi_first_arg
+.decl abi_second_arg(reg:number)
+.input abi_second_arg
+.decl numeric_top(eid:number)
+.input numeric_top
 
-// ── 输入声明 ──────────────────────────────────────────────────────────────────
+.decl reachable_func(func:symbol)
+.decl call_edge(stmt:number, callee:symbol)
+.decl external_edge(stmt:number, name:symbol)
+.decl flow(source:number, dest:number)
+.decl code_value(eid:number, addr:number)
+.decl points_to(eid:number, block:symbol)
+.decl memory_code(block:symbol, addr:number)
+.decl memory_pointer(block:symbol, target:symbol)
 
-.decl filter_set_loc_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
-.input filter_set_loc_vex
+reachable_func(f) :- root(f).
+reachable_func(g) :- call_edge(_,g).
+flow(a,b) :- copy(a,b).
+flow(a,b) :- def_use(a,b).
+// Register actual/formal and return edges are added as targets become known.
+flow(a,b) :- call_edge(s,g), call_input(s,r,a), entry_reg(g,r,b), !abi_sp(r).
+// Defined callees provide the actual exit definition of each clobbered register.
+flow(a,b) :- call_edge(s,g), exit_reg(g,r,a), call_output(s,r,b).
+flow(a,b) :- external_edge(s,n),
+    (n = "memcpy"; n = "memmove"; n = "strcpy"; n = "memset"),
+    call_input(s,r,a), abi_first_arg(r), call_output(s,ret,b), abi_return(ret).
+// Only width-preserving casts transfer pointer/code identities.
+flow(a,b) :- unary(b,op,bits,a), pointer_width(w), bits >= w,
+    (op = "32Uto64"; op = "32Sto64"; op = "64to64"; op = "32to32").
 
-.decl filter_binop_vex_exp(addr:number, op:symbol, arg1Eid:number, arg2Eid:number, resultEid:number)
-.input filter_binop_vex_exp
+code_value(e,a) :- scalar(e,a), function(_,a,_).
+code_value(e,a) :- scalar(e,a), external(a,_).
+code_value(b,a) :- flow(e,b), code_value(e,a).
+points_to(e,b) :- pointer_seed(e,b).
+points_to(e,b) :- scalar(e,a), global_aloc(b,start,size), a >= start, a < start+size.
+points_to(b,p) :- flow(e,b), points_to(e,p).
+points_to(e,b) :- binary(e,op,_,left,_),
+    (op = "Add64"; op = "Add32"; op = "Sub64"; op = "Sub32"; op = "And64"; op = "And32"), points_to(left,b).
+points_to(e,b) :- binary(e,op,_,_,right), (op = "Add64"; op = "Add32"), points_to(right,b).
+points_to(e,b) :- heap_result(s,e,b), external_edge(s,n), (n = "malloc"; n = "calloc"; n = "realloc").
 
-.decl filtered_func(func:symbol, start_addr:number, end_addr:number)
-.input filtered_func
+call_edge(s,g) :- call(s,f,_,_,e,_), reachable_func(f), code_value(e,a), function(g,a,_).
+external_edge(s,n) :- call(s,f,_,_,e,_), reachable_func(f), code_value(e,a), external(a,n).
 
-.decl get_loc_vex_exp(regName:symbol, regEid:number)
-.input get_loc_vex_exp
+// Initial bytes are values of blocks, not executable-instruction constants.
+memory_code(b,a) :- global_word(loc,a), global_aloc(b,start,size), loc >= start, loc < start+size, function(_,a,_).
+memory_code(b,a) :- global_word(loc,a), global_aloc(b,start,size), loc >= start, loc < start+size, external(a,_).
+memory_pointer(b,p) :- global_word(loc,a), global_aloc(b,start,size), loc >= start, loc < start+size,
+    global_aloc(p,other,n), a >= other, a < other+n.
+// Flow-insensitive weak updates: all possible writes contribute to a block.
+memory_code(b,a) :- store(_,f,_,_,e,v), reachable_func(f), points_to(e,b), code_value(v,a).
+memory_pointer(b,p) :- store(_,f,_,_,e,v), reachable_func(f), points_to(e,b), points_to(v,p).
+code_value(v,a) :- load(_,f,_,_,e,v), reachable_func(f), points_to(e,b), memory_code(b,a).
+points_to(v,p) :- load(_,f,_,_,e,v), reachable_func(f), points_to(e,b), memory_pointer(b,p).
+// Conservative stack argument transfer (also covers x86 and AMD64 args > 6).
+// Whole-frame blocks intentionally sacrifice per-slot precision.
+memory_code(c,a) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_), stack_aloc(c,g,_,_), memory_code(b,a).
+memory_pointer(c,p) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_), stack_aloc(c,g,_,_), memory_pointer(b,p).
+.decl memory_transfer(dest:symbol, source:symbol)
+memory_transfer(dest,source) :- external_edge(s,"realloc"), call_input(s,r,a), abi_first_arg(r),
+    call_output(s,ret,result), abi_return(ret), points_to(a,source), points_to(result,dest).
+memory_transfer(dest,source) :- external_edge(s,n), (n = "memcpy"; n = "memmove"; n = "strcpy"),
+    call_input(s,r,a), abi_first_arg(r), call_input(s,q,b), abi_second_arg(q), points_to(a,dest), points_to(b,source).
+memory_code(dest,a) :- memory_transfer(dest,source), memory_code(source,a).
+memory_pointer(dest,p) :- memory_transfer(dest,source), memory_pointer(source,p).
 
-.decl stack_aloc(alocId:symbol, func:symbol, offset:number, size:number)
-.input stack_aloc(filename="stack_aloc.facts")
-
-.decl global_aloc(alocId:symbol, addr:number, size:number)
-.input global_aloc(filename="global_aloc.facts")
-
-.decl heap_aloc(alocId:symbol, func:symbol, callSite:number, size:number)
-.input heap_aloc(filename="heap_aloc.facts")
-
-.decl call_site_raw(caller_irsb:number, instr_addr:number, target_addr:number)
-.input call_site_raw(filename="call_site_raw.facts")
-
-.decl filter_set_mem_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, addrEid:number)
-.input filter_set_mem_vex
-
-.decl filter_get_mem_vex_exp(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:symbol, addrEid:number)
-.input filter_get_mem_vex_exp
-
-.decl reaching_def_exit(func:symbol, irsb:number, regEid:number, version:number)
-.input reaching_def_exit(filename="reaching_def_exit.facts")
-
-// ── Step 1: 初始值集种子 ──────────────────────────────────────────────────────
-
-// 函数起始地址集合
-.decl func_start(func:symbol, addr:number)
-func_start(func, addr) :- filtered_func(func, addr, _).
-
-// A-loc 基地址集合
-.decl aloc_base(alocId:symbol, addr:number)
-aloc_base(id, offset) :- stack_aloc(id, _, offset, _).  // 栈偏移作为"地址"
-aloc_base(id, addr)   :- global_aloc(id, addr, _).
-aloc_base(id, site)   :- heap_aloc(id, _, site, _).
-
-// ── Step 2: 值集传播（流不敏感，递归至不动点）────────────────────────────────
-// value_set(eid, value): EID 可能持有的值（函数地址或 A-loc 基地址）
-
-.decl value_set(eid:number, value:number)
-
-// 种子1：立即数 EID 等于函数起始地址（由 extract_imm_func_eid.py 预处理）
-.decl imm_func_addr_eid(conEid:number, addr:number)
-.input imm_func_addr_eid(filename="imm_func_addr_eid.facts")
-
-value_set(conEid, addr) :- imm_func_addr_eid(conEid, addr).
-
-// 种子2：立即数 EID 等于全局 A-loc 基地址（用预处理文件避免溢出）
-.decl imm_global_eid(conEid:number, addr:number)
-.input imm_global_eid(filename="imm_global_eid.facts")
-
-value_set(conEid, addr) :- imm_global_eid(conEid, addr).
-
-// 传播1：寄存器赋值 regEid = dataEid → regEid 继承 dataEid 的值集
-value_set(regEid, v) :-
-    filter_set_loc_vex(_, _, _, _, _, dataEid, regEid),
-    value_set(dataEid, v).
-
-// 传播2：binop 结果（Add/Sub）— 保守处理：结果继承操作数的值集
-// （精确偏移计算超出本阶段范围，保守传播保证 soundness）
-value_set(resultEid, v) :-
-    filter_binop_vex_exp(_, op, arg1Eid, _, resultEid),
-    (op = "Add64" ; op = "Add32" ; op = "Sub64" ; op = "Sub32"),
-    value_set(arg1Eid, v).
-
-value_set(resultEid, v) :-
-    filter_binop_vex_exp(_, op, _, arg2Eid, resultEid),
-    (op = "Add64" ; op = "Add32"),
-    value_set(arg2Eid, v).
-
-// 传播3：跨 IRSB — 通过 reaching_def_exit 传播架构寄存器值集
-.decl arch_reg_eid(regEid:number)
-arch_reg_eid(eid) :-
-    get_loc_vex_exp(name, eid),
-    (name = "rax" ; name = "rbx" ; name = "rcx" ; name = "rdx" ;
-     name = "rsi" ; name = "rdi" ; name = "rsp" ; name = "rbp" ;
-     name = "r8"  ; name = "r9"  ; name = "r10" ; name = "r11" ;
-     name = "r12" ; name = "r13" ; name = "r14" ; name = "r15" ;
-     name = "eax" ; name = "ebx" ; name = "ecx" ; name = "edx" ;
-     name = "esi" ; name = "edi" ; name = "esp" ; name = "ebp").
-
-// 若某 IRSB 出口处寄存器 regEid 的 reaching def 版本（= instrAddr）有值集
-// 则该寄存器 EID 也继承该值集
-value_set(regEid, v) :-
-    reaching_def_exit(_, _, regEid, version),
-    arch_reg_eid(regEid),
-    value_set(version, v).
-
-// 传播4：内存 store→load — 同一地址 EID 的存取传播值集
-// store: set_mem_vex(dataEid, addrEid) → load: get_mem_vex_exp(loadEid, addrEid)
-// 若 dataEid 有值集，则 loadEid 继承（保守：忽略别名，仅匹配相同 addrEid）
-.decl mem_store_value(addrEid:number, v:number)
-mem_store_value(addrEid, v) :-
-    filter_set_mem_vex(_, _, _, _, _, dataEid, addrEid),
-    value_set(dataEid, v).
-
-value_set(loadRegEid, v) :-
-    filter_get_mem_vex_exp(_, _, instrAddr, _, _, _, addrEid),
-    mem_store_value(addrEid, v),
-    // loadRegEid: 该 load 结果写入的寄存器（同一指令的 set_loc_vex irOrder=1）
-    filter_set_loc_vex(_, _, instrAddr, 1, _, _, loadRegEid).
-
-// ── Step 3: 间接调用解析 ──────────────────────────────────────────────────────
-// VEX IR 中间接调用（call *%rax）表现为：
-//   call_site_raw(irsb, instr, target) 其中 target 不是用户函数起始地址
-// 间接调用指令的 irOrder=1 处：t_dst = t_src（t_src 持有函数指针）
-// 通过 value_set(t_src) 解析实际目标
-
-// 间接调用点：call_site_raw 中 target=0（set()）或 target 不是用户函数起始地址
-.decl indirect_call_site(irsb:number, instrAddr:number)
-indirect_call_site(irsb, instr) :-
-    call_site_raw(irsb, instr, 0).
-indirect_call_site(irsb, instr) :-
-    call_site_raw(irsb, instr, target),
-    target != 0,
-    !func_start(_, target).
-
-// 间接调用指令处 irOrder=1 的 dataEid 即为函数指针来源
+.decl store_to_aloc(instr:number, value:number, block:symbol)
+store_to_aloc(a,v,b) :- store(_,f,a,_,e,v), reachable_func(f), points_to(e,b).
+.decl load_from_aloc(instr:number, value:number, block:symbol)
+load_from_aloc(a,v,b) :- load(_,f,a,_,e,v), reachable_func(f), points_to(e,b).
 .decl indirect_call_target(callSite:number, targetFunc:symbol)
-indirect_call_target(instrAddr, targetFunc) :-
-    indirect_call_site(irsb, instrAddr),
-    filter_set_loc_vex(_, irsb, instrAddr, 1, _, dataEid, _),
-    value_set(dataEid, targetAddr),
-    func_start(targetFunc, targetAddr).
+indirect_call_target(a,g) :- call(s,_,_,a,_,1), call_edge(s,g).
+.decl call_graph(caller:symbol, callee:symbol, site:number)
+call_graph(f,g,a) :- call(s,f,_,a,_,_), call_edge(s,g).
+.decl interproc_edge(source:number, target:number, kind:symbol)
+interproc_edge(a,entry,"call") :- call(s,_,_,a,_,_), call_edge(s,g), function(g,entry,_).
+interproc_edge(ret,dest,"return") :- call(s,f,b,_,_,_), call_edge(s,g), return_block(g,ret), edge(f,b,dest,"Ijk_FakeRet").
+.decl unresolved_call(site:number)
+unresolved_call(a) :- call(s,f,_,a,_,1), reachable_func(f), !call_edge(s,_), !external_edge(s,_).
+.decl value_set(eid:number, value:number)
+value_set(e,a) :- code_value(e,a).
+.decl external_call_target(site:number, name:symbol)
+external_call_target(a,n) :- call(s,_,_,a,_,_), external_edge(s,n).
+// Unknown is recorded separately: an empty target set is never called safe.
+.decl unknown_value(eid:number)
+unknown_value(e) :- unknown_seed(e).
+unknown_value(e) :- numeric_top(e).
+unknown_value(b) :- flow(a,b), unknown_value(a).
+unknown_value(e) :- unary(e,_,_,a), unknown_value(a).
+unknown_value(e) :- binary(e,_,_,a,_), unknown_value(a).
+unknown_value(e) :- binary(e,_,_,_,a), unknown_value(a).
+unknown_value(e) :- binary(e,_,_,a,_), code_value(a,_).
+unknown_value(e) :- binary(e,_,_,_,a), code_value(a,_).
+unknown_value(e) :- unary(e,_,bits,a), pointer_width(w), bits < w, code_value(a,_).
+.decl memory_unknown(block:symbol)
+memory_unknown(b) :- store(_,f,_,_,a,v), reachable_func(f), points_to(a,b), unknown_value(v).
+memory_unknown(b) :- memory_transfer(b,source), memory_unknown(source).
+unknown_value(v) :- load(_,f,_,_,a,v), reachable_func(f), points_to(a,b), memory_unknown(b).
+unknown_value(v) :- load(_,f,_,_,a,v), reachable_func(f), unknown_value(a).
+.decl uncertain_call(site:number)
+uncertain_call(a) :- call(_,f,_,a,e,1), reachable_func(f), unknown_value(e).
 
-// ── 输出 ──────────────────────────────────────────────────────────────────────
-
+.output code_value(filename="code_value.facts")
 .output value_set(filename="value_set.facts")
+.output points_to(filename="points_to.facts")
+.output memory_code(filename="memory_code.facts")
+.output memory_pointer(filename="memory_pointer.facts")
+.output store_to_aloc(filename="store_to_aloc.facts")
+.output load_from_aloc(filename="load_from_aloc.facts")
+.output call_graph(filename="call_graph.facts")
+.output interproc_edge(filename="interproc_edge.facts")
 .output indirect_call_target(filename="indirect_call_target.facts")
+.output reachable_func(filename="reachable_func.facts")
+.output unresolved_call(filename="unresolved_call.facts")
+.output uncertain_call(filename="uncertain_call.facts")
+.output external_call_target(filename="external_call_target.facts")

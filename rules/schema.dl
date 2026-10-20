@@ -1,0 +1,51 @@
+// Schema v2: all locations/expressions/definitions have explicit namespaces.
+.decl function(func:symbol, start:number, end:number)
+.input function
+.decl block(func:symbol, bb:number, is_entry:number)
+.input block
+.decl edge(func:symbol, src:number, dst:number, kind:symbol)
+.input edge
+.decl entry_reg(func:symbol, reg:number, version:number)
+.input entry_reg
+.decl register(reg:number, name:symbol)
+.input register
+.decl statement(stmt:number, func:symbol, bb:number, addr:number, position:number)
+.input statement
+.decl reg_def(stmt:number, func:symbol, bb:number, position:number, reg:number, source:number, version:number)
+.input reg_def
+.decl reg_read(stmt:number, func:symbol, bb:number, position:number, reg:number, dest:number)
+.input reg_read
+.decl copy(source:number, dest:number)
+.input copy
+.decl constant(eid:number, bits:number, value:number)
+.input constant
+.decl binary(eid:number, op:symbol, bits:number, left:number, right:number)
+.input binary
+.decl unary(eid:number, op:symbol, bits:number, source:number)
+.input unary
+.decl load(stmt:number, func:symbol, addr:number, size:number, address:number, dest:number)
+.input load
+.decl store(stmt:number, func:symbol, addr:number, size:number, address:number, value:number)
+.input store
+.decl call(stmt:number, func:symbol, bb:number, addr:number, target:number, indirect:number)
+.input call
+.decl call_input(stmt:number, reg:number, value:number)
+.input call_input
+.decl call_output(stmt:number, reg:number, value:number)
+.input call_output
+.decl return_block(func:symbol, bb:number)
+.input return_block
+.decl global_region(name:symbol, start:number, end:number)
+.input global_region
+.decl global_word(addr:number, value:number)
+.input global_word
+.decl external(addr:number, name:symbol)
+.input external
+.decl root(func:symbol)
+.input root
+.decl stack_root(eid:number, func:symbol)
+.input stack_root
+.decl unknown_seed(eid:number)
+.input unknown_seed
+.decl unsupported(func:symbol, addr:number, reason:symbol)
+.input unsupported

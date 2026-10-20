@@ -1,3 +1,6 @@
 # Ignore generated analysis outputs
 /build/
 /compare/result/
+/.venv
+__pycache__/
+*.pyc

@@ -1,111 +1,38 @@
-// ssa.dl — SSA 变换（BPA-X 阶段四）
-//
-// 论文 Section C：
-//   - 仅对架构寄存器做 SSA 索引（rax/rbx/rcx/rdx/rsi/rdi/r8-r15/rsp/rbp）
-//   - VEX 临时寄存器（t_n）天然唯一，不做 SSA
-//   - 全局/堆/局部内存块不做 SSA
-//   - 栈参数（offset>0 的 stack_aloc）做 SSA 索引
-//
-// 实现：基于 CFG 的 reaching definition 分析
-//   - ssa_def: 每个寄存器定义点 → 版本号（用 instrAddr 作为版本 ID）
-//   - reaching_def: 某定义在某 IRSB 出口处可达
-//   - ssa_use: 每个寄存器使用点 → 对应的 reaching def 版本
-//   - phi_node: 汇合点（多个前驱有不同 reaching def）
-//
-// 输入: filter_set_loc_vex, get_loc_vex_exp, cfg_edge, cfg_node
-// 输出: ssa_def, ssa_use, phi_node
-
-// ── 输入声明 ──────────────────────────────────────────────────────────────────
-
-.decl filter_set_loc_vex(func:symbol, irsbAddr:number, instructionAddr:number, irOrder:number, size:number, dataEid:number, regEid:number)
-.input filter_set_loc_vex
-
-.decl get_loc_vex_exp(regName:symbol, regEid:number)
-.input get_loc_vex_exp
-
-.decl cfg_edge(func:symbol, from_irsb:number, to_irsb:number, edge_type:symbol)
-.input cfg_edge
-
-.decl cfg_node(func:symbol, irsb:number)
-.input cfg_node
-
-// ── Step 1: 识别架构寄存器 EID ────────────────────────────────────────────────
-
-.decl arch_reg_eid(regEid:number, regName:symbol)
-arch_reg_eid(eid, name) :-
-    get_loc_vex_exp(name, eid),
-    (name = "rax" ; name = "rbx" ; name = "rcx" ; name = "rdx" ;
-     name = "rsi" ; name = "rdi" ; name = "rsp" ; name = "rbp" ;
-     name = "r8"  ; name = "r9"  ; name = "r10" ; name = "r11" ;
-     name = "r12" ; name = "r13" ; name = "r14" ; name = "r15" ;
-     name = "eax" ; name = "ebx" ; name = "ecx" ; name = "edx" ;
-     name = "esi" ; name = "edi" ; name = "esp" ; name = "ebp").
-
-// ── Step 2: ssa_def — 每个寄存器写入点即为一个定义版本 ───────────────────────
-// version = instrAddr（唯一标识该定义点）
-
-.decl ssa_def(func:symbol, irsb:number, instrAddr:number, regEid:number, version:number)
-ssa_def(func, irsbAddr, instrAddr, regEid, instrAddr) :-
-    filter_set_loc_vex(func, irsbAddr, instrAddr, _, _, _, regEid),
-    arch_reg_eid(regEid, _).
-
-// ── Step 3: reaching_def_exit — 某定义在某 IRSB 出口处可达 ───────────────────
-// 基础：定义在该 IRSB 内，且该 IRSB 内无后续对同一寄存器的定义覆盖
-
-// 同一 IRSB 内对同一寄存器的最后一个定义（最大 instrAddr）
-.decl last_def_in_irsb(func:symbol, irsb:number, regEid:number, version:number)
-last_def_in_irsb(func, irsb, regEid, version) :-
-    ssa_def(func, irsb, _, regEid, version),
-    version = max v : ssa_def(func, irsb, _, regEid, v).
-
-// IRSB 出口处的 reaching def：
-// 若该 IRSB 内有定义 → 用最后一个定义
-.decl reaching_def_exit(func:symbol, irsb:number, regEid:number, version:number)
-reaching_def_exit(func, irsb, regEid, version) :-
-    last_def_in_irsb(func, irsb, regEid, version).
-
-// 若该 IRSB 内无定义 → 从前驱传播
-reaching_def_exit(func, irsb, regEid, version) :-
-    cfg_node(func, irsb),
-    arch_reg_eid(regEid, _),
-    !last_def_in_irsb(func, irsb, regEid, _),
-    cfg_edge(func, pred, irsb, _),
-    reaching_def_exit(func, pred, regEid, version).
-
-// ── Step 4: phi_node — 汇合点有多个不同版本到达 ──────────────────────────────
-
-.decl phi_node(func:symbol, irsb:number, regEid:number, version:number)
-phi_node(func, irsb, regEid, version) :-
-    cfg_edge(func, pred1, irsb, _),
-    cfg_edge(func, pred2, irsb, _),
-    pred1 != pred2,
-    reaching_def_exit(func, pred1, regEid, version),
-    reaching_def_exit(func, pred2, regEid, v2),
-    version != v2.
-
-// ── Step 5: ssa_use — 每个寄存器读取点对应的 reaching def ────────────────────
-// 读取：filter_set_loc_vex 中 dataEid 是架构寄存器（读取源）
-
-.decl ssa_use(func:symbol, instrAddr:number, regEid:number, version:number)
-ssa_use(func, instrAddr, regEid, version) :-
-    filter_set_loc_vex(func, irsbAddr, instrAddr, _, _, regEid, _),
-    arch_reg_eid(regEid, _),
-    // 找该指令之前同一 IRSB 内最近的定义
-    ssa_def(func, irsbAddr, defAddr, regEid, version),
-    defAddr < instrAddr,
-    defAddr = max d : { ssa_def(func, irsbAddr, d, regEid, _), d < instrAddr }.
-
-// 若同一 IRSB 内无前驱定义 → 用 IRSB 入口处的 reaching def
-ssa_use(func, instrAddr, regEid, version) :-
-    filter_set_loc_vex(func, irsbAddr, instrAddr, _, _, regEid, _),
-    arch_reg_eid(regEid, _),
-    !ssa_def(func, irsbAddr, _, regEid, _),  // 该 IRSB 内无该寄存器的定义
-    cfg_edge(func, pred, irsbAddr, _),
-    reaching_def_exit(func, pred, regEid, version).
-
-// ── 输出 ──────────────────────────────────────────────────────────────────────
-
+// Intraprocedural reaching definitions with instruction-internal order.
+// Definition IDs become SSA-style value IDs; multiple incoming definitions
+// are represented by separate def_use edges (no fictitious instruction IDs).
+#include "schema.dl"
+.decl has_def(func:symbol, bb:number, reg:number)
+has_def(f,b,r) :- reg_def(_,f,b,_,r,_,_).
+.decl last_def(func:symbol, bb:number, reg:number, version:number)
+last_def(f,b,r,v) :- reg_def(_,f,b,o,r,_,v), o = max x : reg_def(_,f,b,x,r,_,_).
+.decl reaching_entry(func:symbol, bb:number, reg:number, version:number)
+.decl reaching_def_exit(func:symbol, bb:number, reg:number, version:number)
+reaching_entry(f,b,r,v) :- block(f,b,1), entry_reg(f,r,v).
+reaching_entry(f,b,r,v) :- edge(f,p,b,_), reaching_def_exit(f,p,r,v).
+reaching_def_exit(f,b,r,v) :- last_def(f,b,r,v).
+reaching_def_exit(f,b,r,v) :- reaching_entry(f,b,r,v), !has_def(f,b,r).
+.decl earlier_def(dest:number)
+earlier_def(d) :- reg_read(_,f,b,o,r,d), reg_def(_,f,b,p,r,_,_), p < o.
+.decl def_use(source:number, dest:number)
+def_use(v,d) :-
+    reg_read(_,f,b,o,r,d), reg_def(_,f,b,p,r,_,v), p < o,
+    p = max x : { reg_def(_,f,b,x,r,_,_), x < o }.
+def_use(v,d) :- reg_read(_,f,b,_,r,d), !earlier_def(d), reaching_entry(f,b,r,v).
+.decl ssa_def(func:symbol, bb:number, instr:number, reg:number, version:number)
+ssa_def(f,b,a,r,v) :- reg_def(s,f,b,_,r,_,v), statement(s,f,b,a,_).
+.decl ssa_use(func:symbol, instr:number, reg:number, version:number)
+ssa_use(f,a,r,v) :- reg_read(s,f,_,_,r,d), statement(s,f,_,a,_), def_use(v,d).
+.decl ssa_use_detail(stmt:number, expr:number, reg:number, version:number)
+ssa_use_detail(s,d,r,v) :- reg_read(s,_,_,_,r,d), def_use(v,d).
+.decl phi_node(func:symbol, bb:number, reg:number, incoming:number)
+phi_node(f,b,r,v) :- reaching_entry(f,b,r,v), reaching_entry(f,b,r,w), v != w.
+.decl exit_reg(func:symbol, reg:number, version:number)
+exit_reg(f,r,v) :- return_block(f,b), reaching_def_exit(f,b,r,v).
+.output def_use(filename="def_use.facts")
 .output ssa_def(filename="ssa_def.facts")
 .output ssa_use(filename="ssa_use.facts")
-.output phi_node(filename="phi_node.facts")
+.output ssa_use_detail(filename="ssa_use_detail.facts")
 .output reaching_def_exit(filename="reaching_def_exit.facts")
+.output phi_node(filename="phi_node.facts")
+.output exit_reg(filename="exit_reg.facts")

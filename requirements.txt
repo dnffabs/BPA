@@ -1,13 +1,5 @@
-# Core analysis dependencies
-angr
-pyelftools
-
-# Compare / evaluation dependencies
-networkx
-matplotlib
-psutil
-
-# Imported directly by compare tools
-capstone
-claripy
-pyvex
+# Tested on Python 3.12.3. angr pins matching archinfo/pyvex components.
+angr==9.2.173
+pyelftools==0.31
+# Unicorn 2.0.1 still imports pkg_resources.
+setuptools==80.9.0

@@ -7,6 +7,9 @@ Usage:
 """
 import sys
 import os
+import argparse
+import json
+from pathlib import Path
 from datetime import datetime
 
 # ── import GT extractor ──────────────────────────────────────────────────────
@@ -14,9 +17,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from extract_dwarf_gt import process as extract_gt
 
 
-# Variables larger than this are structs passed by pointer — prediction cannot
-# infer their total size from single-access VEX IR, so exclude from comparison.
-STACK_SIZE_LIMIT = 4096
+# Never silently discard large variables from ground truth.
+STACK_SIZE_LIMIT = None
 
 
 def load_stack(path, size_limit=STACK_SIZE_LIMIT):
@@ -27,7 +29,7 @@ def load_stack(path, size_limit=STACK_SIZE_LIMIT):
             parts = line.strip().split('\t')
             if len(parts) == 3:
                 sz = int(parts[2])
-                if sz <= size_limit:
+                if size_limit is None or sz <= size_limit:
                     s.add((parts[0], int(parts[1]), sz))
     return s
 
@@ -87,9 +89,9 @@ def metrics_stack_offset(pred_set, gt_set):
 
 def metrics_global_overlap(pred_list, gt_list):
     """
-    Global variable matching by interval overlap instead of exact match.
+    Diagnostic any-overlap matching; this does not measure boundary accuracy.
     A predicted interval [pa, pa+ps) is TP if it overlaps with some GT interval [ga, ga+gs).
-    Each GT interval can only be matched once (greedy by overlap size).
+    Each GT interval can only be matched once (greedy in supplied order).
     """
     # build intervals
     pred_ivs = [(a, a + s) for a, s in pred_list]
@@ -166,43 +168,43 @@ def report(name, pred, gt, out=None, use_overlap=False, use_stack_offset=False):
 
 
 def main():
-    if len(sys.argv) != 4:
-        print("Usage: python evaluate.py <binary> <stack_boundary.facts> <global_boundary.facts>")
-        sys.exit(1)
-
-    binary, stack_facts, global_facts = sys.argv[1], sys.argv[2], sys.argv[3]
-
-    # Step 1: extract GT into stack_gt.tsv / global_gt.tsv next to this script
-    out_dir = os.path.dirname(os.path.abspath(__file__))
-    orig_dir = os.getcwd()
-    os.chdir(out_dir)
-    print(f"Extracting DWARF GT from: {binary}")
-    extract_gt(binary)
-    os.chdir(orig_dir)
-
-    stack_gt_path  = os.path.join(out_dir, 'stack_gt.tsv')
-    global_gt_path = os.path.join(out_dir, 'global_gt.tsv')
-
-    # Step 2: load GT and predictions
-    gt_stack  = load_stack(stack_gt_path)
-    gt_global = load_global(global_gt_path)
-    pred_stack  = load_stack(stack_facts)
-    pred_global = load_global(global_facts)
-
-    # Step 3: report
-    result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'result')
-    os.makedirs(result_dir, exist_ok=True)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    result_file = os.path.join(result_dir, f"{os.path.basename(binary)}_{ts}.txt")
-
-    with open(result_file, 'w') as out:
-        header = f"Binary: {binary}\nTime: {datetime.now().isoformat()}\n"
-        print(header); out.write(header + '\n')
-        report("Local Variables (stack) — exact", pred_stack, gt_stack, out)
-        report("Local Variables (stack) — offset match", pred_stack, gt_stack, out, use_stack_offset=True)
-        report("Global Variables",        pred_global, gt_global, out, use_overlap=True)
-
-    print(f"\n[compare] 结果已保存至: {result_file}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('binary')
+    parser.add_argument('stack_facts')
+    parser.add_argument('global_facts')
+    parser.add_argument('--output-dir', required=True)
+    args = parser.parse_args()
+    result_dir = Path(args.output_dir).resolve()
+    result_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = Path(args.stack_facts).parent / 'metadata.json'
+    binary_metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    bias = binary_metadata.get('mapped_base', 0) - binary_metadata.get('linked_base', 0)
+    gt = extract_gt(args.binary, result_dir, load_bias=bias)
+    if not gt['has_dwarf']:
+        print('[compare] skipped: no DWARF; empty GT files were written, old results were not reused')
+        return
+    gt_stack = load_stack(result_dir / 'stack_gt.tsv')
+    gt_global = load_global(result_dir / 'global_gt.tsv')
+    pred_stack = load_stack(args.stack_facts)
+    pred_global = load_global(args.global_facts)
+    result_file = result_dir / 'report.txt'
+    with result_file.open('w') as out:
+        out.write(f'Binary: {args.binary}\nStack basis: entry SP\n')
+        out.write('Exact object metrics measure partition precision. Coarse blocks may have low scores.\n')
+        report('Stack blocks vs DWARF variables — exact', pred_stack, gt_stack, out)
+        report('Global blocks vs DWARF variables — exact', pred_global, gt_global, out)
+        # Report interval quality separately, never label any-overlap as boundary accuracy.
+        ious = []
+        for address, size in pred_global:
+            best = 0.0
+            for base, length in gt_global:
+                intersection = max(0, min(address+size, base+length)-max(address, base))
+                union = size + length - intersection
+                best = max(best, intersection/union if union else 0.0)
+            ious.append(best)
+        out.write(f'Global mean best interval IoU (per predicted block): {sum(ious)/len(ious) if ious else 0:.6f}\n')
+        out.write(f"Skipped DWARF locations: {gt['skipped_locations']}\n")
+    print(f'[compare] {result_file}')
 
 
 if __name__ == '__main__':

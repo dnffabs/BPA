@@ -1,199 +1,128 @@
 #!/usr/bin/env python3
-"""
-Extract DWARF ground-truth for local and global variables.
+"""Extract variable GT into an explicit output directory (entry-SP basis)."""
+import argparse
+import json
+from pathlib import Path
+import re
 
-Local output  (stack_gt.tsv):  func_name  offset  size
-Global output (global_gt.tsv): abs_addr   size
-
-Usage:
-    python extract_dwarf_gt.py <binary>
-"""
-import sys
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_DWARF_expr, set_global_machine_arch
 from elftools.dwarf.locationlists import LocationEntry, LocationExpr, LocationParser
 
 
-def get_var_size(die, CU):
-    """Recursively resolve byte size of a variable's type."""
-    type_attr = die.attributes.get('DW_AT_type')
-    if not type_attr:
-        bs = die.attributes.get('DW_AT_byte_size')
-        return bs.value if bs else 0
-    try:
-        type_die = CU.get_DIE_from_refaddr(type_attr.value + CU.cu_offset)
-    except Exception:
+def get_var_size(die, CU=None, seen=None):
+    seen = set() if seen is None else set(seen)
+    if die.offset in seen:
         return 0
-    if type_die.tag == 'DW_TAG_array_type':
-        # product of subrange counts * element size
-        counts = []
-        for child in type_die.iter_children():
-            if child.tag == 'DW_TAG_subrange_type':
-                ub = child.attributes.get('DW_AT_upper_bound')
-                lb = child.attributes.get('DW_AT_lower_bound')
-                ub = ub.value if ub else 0
-                lb = lb.value if lb else 0
-                counts.append(ub - lb + 1)
-        elem_size = get_var_size(type_die, CU)
-        mul = 1
-        for c in counts:
-            mul *= c
-        return mul * elem_size
-    return get_var_size(type_die, CU)
+    seen.add(die.offset)
+    size = die.attributes.get('DW_AT_byte_size')
+    if size is not None:
+        return size.value
+    if die.tag == 'DW_TAG_pointer_type':
+        return die.cu['address_size']
+    if die.tag == 'DW_TAG_array_type':
+        if 'DW_AT_type' not in die.attributes:
+            return 0
+        result = get_var_size(die.get_DIE_from_attribute('DW_AT_type'), seen=seen)
+        dimensions = 0
+        for child in die.iter_children():
+            if child.tag != 'DW_TAG_subrange_type':
+                continue
+            count = child.attributes.get('DW_AT_count')
+            upper = child.attributes.get('DW_AT_upper_bound')
+            lower = child.attributes.get('DW_AT_lower_bound')
+            if count is not None and isinstance(count.value, int):
+                n = count.value
+            elif upper is not None and isinstance(upper.value, int):
+                n = upper.value - (lower.value if lower else 0) + 1
+            else:
+                return 0
+            result *= max(n, 0)
+            dimensions += 1
+        return result if dimensions else 0
+    if 'DW_AT_type' in die.attributes:
+        try:
+            return get_var_size(die.get_DIE_from_attribute('DW_AT_type'), seen=seen)
+        except (KeyError, NotImplementedError):
+            return 0
+    return 0
 
 
-def parse_loc_expr(loc_expr_str):
-    """Return (register_hint, offset) from a DWARF expression string."""
-    s = loc_expr_str.replace('(', '').replace(')', '').replace(' ', '')
-    for reg in ('DW_OP_fbreg', 'rbp', 'ebp', 'DW_OP_addr'):
-        if reg in s:
-            parts = s.split(':')
-            val = parts[1].strip() if len(parts) > 1 else '0'
-            try:
-                # DW_OP_addr values are bare hex (no 0x prefix); fbreg/rbp/ebp are decimal
-                if reg == 'DW_OP_addr':
-                    num = int(val, 16)
-                else:
-                    num = int(val)
-            except ValueError:
-                num = 0
-            return reg, num
+def parse_loc_expr(text):
+    match = re.search(r'DW_OP_fbreg:\s*(-?\d+)', text)
+    if match:
+        return 'DW_OP_fbreg', int(match[1])
+    match = re.search(r'DW_OP_addr:\s*(?:0x)?([0-9a-fA-F]+)', text)
+    if match:
+        return 'DW_OP_addr', int(match[1], 16)
     return None, None
 
 
-def extract_local_offset(die, loc_parser, location_lists, dwarfinfo, CU, arch):
-    """Return (offset, size) matching stack_boundary.dl's reference point.
-
-    stack_boundary.dl uses fbreg-relative offsets directly (CFA-relative).
-    - DW_OP_fbreg: use value as-is
-    - rbp/ebp-relative: add ptr_size to convert to same basis
-        x86: ebp_val + 4  (ebp = CFA - 8, fbreg base = CFA - 4, diff = +4)
-        x64: rbp_val + 8
-    """
-    is64 = arch in ('x64', 'AMD64')
-    ptr = 8 if is64 else 4
-
-    size = get_var_size(die, CU)
-    if size == 0:
-        return None
-    for attr in die.attributes.values():
-        if not loc_parser.attribute_has_location(attr, CU['version']):
-            continue
-        loc = loc_parser.parse_from_attribute(attr, CU['version'], die)
-        exprs = []
-        if isinstance(loc, LocationExpr):
-            exprs = [describe_DWARF_expr(loc.loc_expr, dwarfinfo.structs, CU.cu_offset)]
-        elif isinstance(loc, list):
-            exprs = [describe_DWARF_expr(e.loc_expr, dwarfinfo.structs, CU.cu_offset)
-                     for e in loc if isinstance(e, LocationEntry)]
-        for expr_str in exprs:
-            reg, val = parse_loc_expr(expr_str)
-            if val is None:
-                continue
-            if reg == 'DW_OP_fbreg':
-                # fbreg X = CFA + X = ebp + 2*ptr + X → convert to ebp-relative
-                return val + 2 * ptr, size
-            if reg in ('rbp', 'ebp'):
-                # already ebp/rbp-relative, return as-is
-                return val, size
-    return None
+def locations(die, parser, dwarf, cu):
+    attr = die.attributes.get('DW_AT_location')
+    if attr is None or not parser.attribute_has_location(attr, cu['version']):
+        return []
+    try:
+        location = parser.parse_from_attribute(attr, cu['version'], die)
+    except (KeyError, NotImplementedError):
+        return []
+    exprs = [location.loc_expr] if isinstance(location, LocationExpr) else [x.loc_expr for x in location if isinstance(x, LocationEntry)]
+    return [describe_DWARF_expr(expr, dwarf.structs, cu.cu_offset) for expr in exprs]
 
 
-def extract_global_addr(die, loc_parser, location_lists, dwarfinfo, CU):
-    """Return (abs_addr, size) for a global variable DIE, or None."""
-    size = get_var_size(die, CU)
-    if size == 0:
-        return None
-    for attr in die.attributes.values():
-        if not loc_parser.attribute_has_location(attr, CU['version']):
-            continue
-        loc = loc_parser.parse_from_attribute(attr, CU['version'], die)
-        exprs = []
-        if isinstance(loc, LocationExpr):
-            exprs = [describe_DWARF_expr(loc.loc_expr, dwarfinfo.structs, CU.cu_offset)]
-        elif isinstance(loc, list):
-            exprs = [describe_DWARF_expr(e.loc_expr, dwarfinfo.structs, CU.cu_offset)
-                     for e in loc if isinstance(e, LocationEntry)]
-        for expr_str in exprs:
-            reg, val = parse_loc_expr(expr_str)
-            if reg == 'DW_OP_addr' and val is not None and val != 0:
-                return val, size
-    return None
+def process(binary_path, output_dir='.', load_bias=0):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    local_rows, global_rows, skipped = set(), set(), 0
+    with open(binary_path, 'rb') as stream:
+        elf = ELFFile(stream)
+        has_debug = any(elf.get_section_by_name(name) is not None
+                        for name in ('.debug_info', '.zdebug_info'))
+        if has_debug:
+            set_global_machine_arch(elf.get_machine_arch())
+            dwarf = elf.get_dwarf_info()
+            parser = LocationParser(dwarf.location_lists())
+            ptr = elf.elfclass // 8
 
-
-def walk_globals(die, loc_parser, location_lists, dwarfinfo, CU, results):
-    """Recursively collect global variables from all DIE levels."""
-    for child in die.iter_children():
-        if child.tag == 'DW_TAG_variable':
-            decl = child.attributes.get('DW_AT_declaration')
-            if decl and decl.value:
-                continue
-            name_attr = child.attributes.get('DW_AT_name')
-            if name_attr:
-                r = extract_global_addr(child, loc_parser, location_lists, dwarfinfo, CU)
-                if r:
-                    results.append(r)
-        # recurse into namespaces, classes, etc.
-        elif child.tag not in ('DW_TAG_subprogram', 'DW_TAG_lexical_block'):
-            walk_globals(child, loc_parser, location_lists, dwarfinfo, CU, results)
-
-
-def walk_locals(die, func_name, loc_parser, location_lists, dwarfinfo, CU, arch, results):
-    for child in die.iter_children():
-        if child.tag in ('DW_TAG_variable', 'DW_TAG_formal_parameter'):
-            r = extract_local_offset(child, loc_parser, location_lists, dwarfinfo, CU, arch)
-            if r:
-                results.append((func_name, r[0], r[1]))
-        if child.tag in ('DW_TAG_lexical_block', 'DW_TAG_inlined_subroutine'):
-            walk_locals(child, func_name, loc_parser, location_lists, dwarfinfo, CU, arch, results)
-
-
-def process(binary_path):
-    local_rows = []   # (func_name, offset, size)
-    global_rows = []  # (abs_addr, size)
-
-    with open(binary_path, 'rb') as f:
-        elf = ELFFile(f)
-        if not elf.has_dwarf_info():
-            print("No DWARF info found.")
-            return
-        arch = elf.get_machine_arch()
-        set_global_machine_arch(arch)
-        dwarfinfo = elf.get_dwarf_info()
-        location_lists = dwarfinfo.location_lists()
-        loc_parser = LocationParser(location_lists)
-
-        for CU in dwarfinfo.iter_CUs():
-            top = CU.get_top_DIE()
-            # Global variables: walk all DIE levels
-            walk_globals(top, loc_parser, location_lists, dwarfinfo, CU, global_rows)
-
-            # Functions → local variables
-            for die in top.iter_children():
+            def walk(die, cu, function=None, cfa_frame=False):
+                nonlocal skipped
                 if die.tag == 'DW_TAG_subprogram':
-                    name_attr = die.attributes.get('DW_AT_name')
-                    decl = die.attributes.get('DW_AT_declaration')
-                    if name_attr and not (decl and decl.value):
-                        func_name = name_attr.value
-                        if isinstance(func_name, bytes):
-                            func_name = func_name.decode('utf-8', errors='replace')
-                        walk_locals(die, func_name, loc_parser, location_lists, dwarfinfo, CU, arch, local_rows)
+                    attr = die.attributes.get('DW_AT_name')
+                    function = attr.value.decode(errors='replace') if attr and isinstance(attr.value, bytes) else None
+                    base = die.attributes.get('DW_AT_frame_base')
+                    cfa_frame = bool(base and base.form == 'DW_FORM_exprloc' and
+                                     list(base.value) == [0x9c])
+                if die.tag in ('DW_TAG_variable', 'DW_TAG_formal_parameter'):
+                    size = get_var_size(die, cu)
+                    matched = False
+                    for text in locations(die, parser, dwarf, cu):
+                        kind, value = parse_loc_expr(text)
+                        if size and kind == 'DW_OP_addr':
+                            global_rows.add((value + load_bias, size))
+                            matched = True
+                        elif size and function and cfa_frame and kind == 'DW_OP_fbreg':
+                            # CFA at function entry is entry-SP + return-address size.
+                            local_rows.add((function, value + ptr, size))
+                            matched = True
+                    if not matched and 'DW_AT_location' in die.attributes:
+                        skipped += 1
+                for child in die.iter_children():
+                    walk(child, cu, function, cfa_frame)
 
-    # Write stack_gt.tsv
-    with open('stack_gt.tsv', 'w') as f:
-        for func, offset, size in local_rows:
-            f.write(f"{func}\t{offset}\t{size}\n")
-    print(f"stack_gt.tsv: {len(local_rows)} entries")
-
-    # Write global_gt.tsv
-    with open('global_gt.tsv', 'w') as f:
-        for addr, size in global_rows:
-            f.write(f"{addr}\t{size}\n")
-    print(f"global_gt.tsv: {len(global_rows)} entries")
+            for cu in dwarf.iter_CUs():
+                walk(cu.get_top_DIE(), cu)
+    for name, data in [('stack_gt.tsv', local_rows), ('global_gt.tsv', global_rows)]:
+        (output_dir / name).write_text(''.join('\t'.join(map(str, row))+'\n' for row in sorted(data)))
+    metadata = {'has_dwarf': has_debug, 'stack_reference': 'function entry SP',
+                'stack_entries': len(local_rows), 'global_entries': len(global_rows),
+                'skipped_locations': skipped, 'load_bias': load_bias}
+    (output_dir / 'gt_metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
+    return metadata
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        print("Usage: python extract_dwarf_gt.py <binary>")
-        sys.exit(1)
-    process(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('binary')
+    parser.add_argument('--output-dir', default='.')
+    args = parser.parse_args()
+    print(json.dumps(process(args.binary, args.output_dir)))
