@@ -1,10 +1,10 @@
 # 基础流程修复与验证记录
 
-日期：2026-10-20。基于提交 `6f88d431f875afe515a3c39f1b24eb51666996b4`，修复保留在工作区，未提交或推送。
+日期：2026-10-20。首轮修复基于提交 `6f88d431f875afe515a3c39f1b24eb51666996b4`；本页保留验证记录，当前安装与运行方式见根目录 README。
 
 ## 修复范围
 
-主流水线迁移为统一的 facts schema v2；旧 facts 必须重新生成。修复不依赖原始 BPA 或官方 BPA-X 仓库的分析代码，仅复用本机已有 Python 依赖环境与 Soufflé。
+主流水线迁移为统一的 facts schema v2；旧 facts 必须重新生成。修复不依赖原始 BPA 或官方 BPA-X 仓库的分析代码。首轮验证复用已有 Python 依赖环境，随后通过独立 uv 环境再次验证。
 
 - VEX 临时变量按基本块隔离；Load/Store/Call/Unop 使用统一的表达式 ID。
 - 使用 VEX 语句顺序建立寄存器 reaching-def/def-use，修复先读后写和同机器指令多定义。
@@ -50,14 +50,14 @@ TP/FP/FN 统计的是每个调用点的目标边。分支案例的同一调用�
 
 基本参数与寄存器覆盖案例要求目标集合精确相等；内存、工厂和原仓库 demo 要求覆盖所有预期目标，并单独统计额外候选。当前保守内存抽象仍有 14 条额外边，不能解释为已解决精度问题。
 
-## 本机直接运行已验证
+## 基础 demo 复现
 
 ```bash
-cd /home/qc/Desktop/binwork/mywork/BPA
+# 在仓库根目录执行；Python 环境按 README 使用 uv 创建
 mkdir -p build
 gcc -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer pipeline/bin/test.c -o build/demo
 ./build/demo
-./pipeline/run.sh build/demo --output build/demo-analysis --compare
+uv run --locked ./pipeline/run.sh build/demo --output build/demo-analysis --compare
 ```
 
 仓库 demo 的两处间接调用均包含实际目标，输出各有 `{add, sub}`；`summary.json` 为 completed，unresolved_calls 为空。它们仍有额外候选与保守 unknown 提示，不能据此宣称对任意程序完备。
@@ -69,6 +69,19 @@ gcc -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer pipeline/bin/test.c -o build
 - `build/regressions/<case>/analysis/`：各案例 facts、分析摘要和可选 DWARF 评估。
 - `build/demo-runtime.log`：本机原 demo 运行输出。
 - `build/demo-analysis/`：文档运行命令的实际产物。
+
+## uv 环境复验
+
+公开安装方案使用 `.python-version`、`pyproject.toml` 和 `uv.lock`。迁移后 `.venv` 为本项目独立环境，原共享环境保留。
+
+- uv 0.13.3，CPython 3.12.15。
+- angr / pyvex 9.2.173、pyelftools 0.31。
+- 固定兼容约束 `bitstring<5`、`pycparser<3`，解决未锁定传递依赖导致的导入失败。
+- `uv sync --locked` 与 `uv pip check` 通过。
+- `uv run --locked python tests/run_regressions.py`：7 个测试方法、17 个原生案例通过；32 个调用点，TP=34、FP=14、FN=0。
+- README 的 demo 命令经 uv 运行通过，包括可选 DWARF 评估。
+
+本次环境信息、锁文件摘要与验证日志保存在 `build/uv-validation/`，该目录不提交。
 
 ## 保留的限制
 

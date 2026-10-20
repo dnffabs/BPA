@@ -1,0 +1,25 @@
+[project]
+name = "bpa-binary-analysis"
+version = "0.1.0"
+description = "Block-based points-to analysis and indirect call target resolution for ELF binaries"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "angr==9.2.173",
+    "pyelftools==0.31",
+    # Unicorn 2.0.1 imports pkg_resources, which newer setuptools removes.
+    "setuptools==80.9.0",
+]
+
+[project.urls]
+Repository = "https://github.com/dnffabs/BPA"
+Issues = "https://github.com/dnffabs/BPA/issues"
+
+[tool.uv]
+package = false
+constraint-dependencies = [
+    # pyvex 9.2.173 still uses ConstBitStream, removed in bitstring 5.
+    "bitstring<5",
+    # angr 9.2.173 patches lexer attributes exposed by pycparser 2.x.
+    "pycparser<3",
+]

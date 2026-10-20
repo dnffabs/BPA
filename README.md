@@ -1,84 +1,318 @@
-# BPA：可运行的二进制指针分析基线
+# BPA · Block-based Points-to Analysis
 
-本仓库使用 angr/VEX 提取二进制语义，以 Soufflé 做寄存器 def-use、内存块 points-to 和过程间间接调用目标分析。当前实现是 **schema v2 基础版本**，不是 BPA-X 论文的完整复现。
+面向 ELF 二进制的块级指针分析研究原型：通过 **angr / VEX IR** 提取程序语义，使用 **Soufflé Datalog** 联合求解指针值传播、过程间调用关系与间接调用目标。
 
-## 本机快速运行
+项目采用 BPA / BPA-X 的内存块分析思路，提供可运行、可检查、可回归的基础流程。当前版本使用 **facts schema v2**，Python 环境与依赖由 **uv** 管理。
 
-```bash
-cd /home/qc/Desktop/binwork/mywork/BPA
-mkdir -p build
-gcc -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer \
-    pipeline/bin/test.c -o build/demo
-./pipeline/run.sh build/demo --output build/demo-analysis --compare
-```
+[环境要求](#环境要求) · [快速开始](#快速开始) · [项目结构](#项目结构) · [使用方法](#使用方法) · [输出说明](#输出说明) · [回归测试](#回归测试) · [当前限制](#当前限制)
 
-结果在 `build/demo-analysis/facts/`；执行状态和输入 SHA256 在 `build/demo-analysis/summary.json`。
+## 功能概览
 
-- `indirect_call_target.facts`：`调用点十进制地址<TAB>用户目标函数名`。
-- `call_graph.facts`：调用者、被调函数、调用点，包含新解析出的间接调用边。
-- `interproc_edge.facts`：调用与返回边。
-- `ssa_def/ssa_use/def_use.facts`：定义版本和读取关系。
-- `points_to/memory_code/memory_pointer.facts`：表达式及内存块的值。
-- `store_to_aloc/load_from_aloc.facts`：真实接入值分析的内存访问映射。
-- `call_resolution.facts`：每个可达间接调用点、所属函数、用户目标数、外部目标数，保留未解析点。
-- `external_call_target.facts`：外部调用目标，单独于用户函数目标输出。
-- `unresolved_call.facts`：尚未找到目标的可达间接调用。
-- `uncertain_call.facts`：目标表达式受 unknown 语义影响的调用，即使已找到部分目标也会保留提示。
-- `unsupported.facts`：当前没有完整语义模型的语句/表达式。空目标集合不能解释为运行时不会发生调用。
+- **统一中间表示**：将 VEX 中的寄存器读写、内存访问、表达式与调用目标转换为 TSV facts。
+- **寄存器定义追踪**：按基本块和 VEX 语句顺序建立定义与读取关系，区分覆盖赋值前后的寄存器值。
+- **块级内存分析**：通过栈、全局与堆块连接 store / load，支持全局初始化函数指针。
+- **过程间分析**：连接参数与返回寄存器，在同一个 Datalog 不动点中更新值集和调用图。
+- **诊断与评估**：输出未解析调用、未知语义提示，并可利用 DWARF 评估内存块边界。
 
-`--compare` 可选；有 DWARF 时，评估输出在本次目录的 `evaluation/` 中。没有 DWARF 时明确跳过，不读取其他程序留下的 GT。主分析仍需 `.symtab` 中定义的函数入口与大小；完全 stripped 的输入会明确报错。
-
-## 流程
+### 分析流程
 
 ```mermaid
 flowchart LR
-    A[ELF + VEX] --> B[统一 facts]
-    B --> C[函数内 CFG]
-    C --> D[寄存器定义与读取]
-    D --> E[有限的标量/栈偏移预分析]
-    E --> F[栈/全局/堆块]
-    F --> G[过程间 Datalog 不动点]
-    G --> H[调用图 + 目标 + 诊断]
+    A[ELF binary] --> B[angr / VEX]
+    B --> C[Normalized facts]
+    C --> D[CFG + register def-use]
+    D --> E[Scalar / stack-offset prepass]
+    E --> F[Stack / global / heap blocks]
+    F --> G[Interprocedural Datalog fixed point]
+    G --> H[Call targets + call graph + diagnostics]
 ```
 
-`analysis.dl` 内联合求解：值集 → 新调用目标 → 实参/形参和返回值流 → 新值集。因此不依赖多次重跑不相连的 shell 阶段。函数内 CFG 与 def-use 已给所有调用位置预置 ABI 读取/返回版本，新增被调函数时无需重新分配这些版本。
+## 环境要求
 
-## 当前支持与精度边界
+| 组件 | 要求 | 用途 |
+| --- | --- | --- |
+| 操作系统 | Linux x86_64；Windows 可使用 WSL2 | 原生分析与测试 |
+| Python | CPython **3.12**，由 uv 管理 | 运行分析工具 |
+| uv | 已验证 **0.13.3** | Python 安装、虚拟环境与依赖锁定 |
+| Soufflé | 已验证 **2.5**，64 位 word | 执行 Datalog 规则 |
+| GCC / binutils | 已验证 GCC **13.3** | 编译与检查测试程序 |
+| Bash / Git / curl / file | 常规 Linux 工具 | 运行入口、获取代码与批量分析 |
+| 32 位开发库 | 运行完整回归时需要 | 编译、执行 x86 样例 |
 
-- 原生验证覆盖 Linux AMD64、X86，以及 AMD64 PIE。
-- 寄存器按定义版本区分；同一机器指令内使用 VEX 语句顺序区分定义与读取。
-- 内存使用流不敏感的弱更新，上下文不敏感。
-- 保守基线默认每个函数一个栈帧块、每个全局 section 一个块；堆按直接识别到的分配调用点建块。这能避免数组内部地址被误切，但会产生额外候选。
-- 栈块数值范围用于描述已观察到的地址；抽象身份代表整个函数帧，未知偏移不会因超出描述范围而被删除。
-- 调用参数通过寄存器连接；栈参数采用保守的帧内容传递。栈对象、函数上下文、字段均未进一步区分。
-- `malloc/calloc/realloc` 有返回指针模型；AMD64 的已知大小按各自 ABI 参数计算。X86 暂保留未知分配大小。支持基础 realloc 内容转移和 AMD64 memcpy/memmove/strcpy/memset 返回值摘要。
-- 尚未实现完整 stripped 函数恢复、C++/异常/尾调用、全部 VEX 操作、全部库函数副作用/外部回调、通过动态分配器函数指针创建堆块。
-- 对未知操作保留诊断；本版本不声称对任意二进制 sound，也不将本次小例子的召回率外推到大型程序。
+分析已有 ELF 时无需重新编译。**uv 仅管理 Python 环境，不安装 Soufflé、GCC 或系统开发库。**
 
-## 回归验证
+### 1. 安装系统工具
+
+Ubuntu / Debian 示例：
 
 ```bash
-.venv/bin/python tests/run_regressions.py
+sudo apt update
+sudo apt install -y git curl build-essential binutils file
 ```
 
-测试会实际编译、运行并分析样例，检查预期目标是否被找到；寄存器覆盖和单参数回调还检查没有额外目标。结果保存为 `build/regressions/results.json`。在限制 32 位系统调用的沙箱中，32 位程序会收到 SIGSYS；应从本机普通终端运行整个测试。
-
-测试包括：寄存器覆盖、先读后写、同指令多个定义、临时变量命名空间、Unop、偏移累计、块内访问、参数/返回值、间接工厂调用、全局初始化指针、堆字段、calloc/realloc、栈传参、分支循环、传统 PLT、未知目标和 stripped 输入失败处理。
-
-## 环境
-
-本机 `.venv` 复用此前已经安装的 BPA-X 环境；该链接和所有 build 产物均不进入 Git。换机可创建自己的 `.venv`：
+完整回归同时包含 x86 和 x64 程序，需额外安装：
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+sudo apt install -y gcc-multilib libc6-dev-i386
 ```
 
-运行入口按 `BPA_PYTHON` → 仓库 `.venv/bin/python` → PATH 的 `python3` 查找解释器。Soufflé 按 `SOUFFLE` → PATH → 当前研究工作区的 `souffle` 查找。
+### 2. 安装 Soufflé
+
+按 [官方安装指南](https://souffle-lang.github.io/install) 安装适配当前系统的发行包，或从源码构建。预编译包可从 [官方 Releases](https://github.com/souffle-lang/souffle/releases) 获取。
+
+确认引擎可用，并检查输出中的版本与 word size：
 
 ```bash
-BPA_PYTHON=/path/to/venv/bin/python SOUFFLE=/path/to/souffle \
-  ./pipeline/run.sh /path/to/program
+souffle --version
 ```
 
-详见 [facts 数据契约](docs/FACTS.md)、[环境要求](docs/REQUIREMENTS.md)、[修复与验证记录](docs/REPAIR_VALIDATION.md)。旧的 `tools/Demo/`、`tools/local_address.py` 等 schema v1 原型不属于当前主流水线；旧 facts 必须重新生成，不能混用于 v2 规则。
+若引擎没有加入 PATH，可指定其绝对路径：
+
+```bash
+export SOUFFLE=/absolute/path/to/souffle
+```
+
+### 3. 安装 uv
+
+Linux / WSL2：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+其他安装方式见 [uv 官方文档](https://docs.astral.sh/uv/getting-started/installation/)。
+
+## 快速开始
+
+### 获取代码与创建环境
+
+```bash
+git clone https://github.com/dnffabs/BPA.git
+cd BPA
+
+uv python install 3.12
+uv sync --locked
+uv run --locked python --version
+```
+
+uv 根据 `.python-version` 选择 Python，在项目根目录创建独立的 `.venv`，并按 `uv.lock` 安装依赖。使用 `uv run` 时无需手动激活环境。
+
+### 编译并分析自带 demo
+
+```bash
+mkdir -p build
+
+gcc -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer \
+    pipeline/bin/test.c -o build/demo
+
+# 运行样例，检查其原生行为
+./build/demo
+
+# 执行分析，并使用编译时保留的 DWARF 做边界评估
+uv run --locked ./pipeline/run.sh build/demo \
+    --output build/demo-analysis \
+    --compare
+```
+
+查看执行状态和间接调用候选：
+
+```bash
+cat build/demo-analysis/summary.json
+cat build/demo-analysis/facts/indirect_call_target.facts
+```
+
+`summary.json` 的 `status: completed` 表示流水线执行成功。是否找全目标、是否存在额外候选，需要结合目标文件与诊断结果判断。当前保守内存抽象可能在同一调用点同时给出 `add`、`sub` 两个候选。
+
+## 项目结构
+
+下面列出当前主流水线涉及的文件。各阶段通过 `facts/` 中的同名关系传递数据。
+
+```text
+BPA/
+├── README.md                         # 项目入口文档
+├── pyproject.toml                    # Python 版本约束与直接依赖
+├── uv.lock                           # uv 生成的依赖锁文件
+├── .python-version                   # Python 版本请求：3.12
+├── requirements.txt                  # 从 uv.lock 导出的兼容依赖列表
+│
+├── pipeline/                         # Shell 运行入口
+│   ├── run.sh                        # 单个 ELF 的完整分析
+│   ├── run_all.sh                    # 批量分析目录中的 ELF
+│   ├── common.sh                     # 统一选择 Python 解释器
+│   ├── preprocess.sh                 # 预处理及其前置步骤
+│   ├── cfg.sh                        # CFG 阶段及其前置步骤
+│   ├── ssa.sh                        # 定义与读取关系及其前置步骤
+│   ├── boundary_gen.sh               # 内存块生成及其前置步骤
+│   ├── analysis.sh                   # 值分析及其前置步骤
+│   ├── compare.sh                    # 分析与可选 DWARF 评估
+│   └── bin/test.c                    # 自带 C demo
+│
+├── tools/                            # Python 分析工具
+│   ├── run_pipeline.py               # 阶段调度、执行摘要与日志
+│   ├── generate_facts.py             # ELF / CFG / VEX 事实提取
+│   ├── memory_model.py               # 有限标量、栈偏移与分配点预分析
+│   └── vex2Datalog/
+│       ├── parser.py                 # VEX 表达式和语句转换
+│       └── DatalogFacts.py           # ID 分配及 TSV facts 写出
+│
+├── rules/                            # Soufflé 规则
+│   ├── schema.dl                     # schema v2 输入数据契约
+│   ├── preprocess.dl                 # 函数视图
+│   ├── cfg.dl                        # 函数内 CFG
+│   ├── ssa.dl                        # reaching definitions / def-use
+│   ├── stack_boundary.dl             # 栈帧块
+│   ├── global_boundary.dl            # 全局 section 块
+│   ├── heap_boundary.dl              # 堆分配点块
+│   ├── aloc_gen.dl                   # 抽象内存位置 ID
+│   └── analysis.dl                   # 指针、内存、调用图的联合求解
+│
+├── compare/                          # DWARF 真值提取与边界评估
+│   ├── extract_dwarf_gt.py
+│   └── evaluate.py
+├── tests/
+│   ├── fixtures/                     # 各分析能力的 C 样例
+│   └── run_regressions.py            # 语义与原生流程回归
+├── docs/
+│   ├── FACTS.md                      # facts 字段与语义
+│   ├── REQUIREMENTS.md               # 环境配置与故障排查
+│   └── REPAIR_VALIDATION.md           # 基线修复与验证记录
+└── build/                            # 编译产物、facts、日志与评估；不提交
+```
+
+`tools/Demo/`、旧地址提取脚本和其他历史文件保留供研究参考，不参与当前主流程。schema v1 的历史 facts 需重新生成后才能用于当前规则。
+
+## 使用方法
+
+以下命令均在项目根目录执行。
+
+### 分析自己的程序
+
+```bash
+uv run --locked ./pipeline/run.sh /path/to/program \
+    --output build/program-analysis \
+    --entry main \
+    --jobs 4
+```
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `binary` | 必填 | 待分析 ELF 路径 |
+| `--output`, `-o` | `build/<名称>_<路径哈希>_dir` | 保存本次分析产物 |
+| `--entry` | `main` | 分析入口函数名 |
+| `--jobs`, `-j` | `4` | Soufflé 线程数 |
+| `--compare` | 关闭 | 使用 DWARF 评估内存边界 |
+| `--stage` | `analysis` | 执行至指定阶段，包含其前置步骤 |
+
+阶段顺序为 `preprocess → cfg → ssa → boundary_gen → analysis`；启用 `--compare` 后继续执行 `compare`。
+
+输入需保留 `.symtab` 中已定义函数的入口与大小。DWARF 调试信息仅用于 `--compare`：没有 DWARF 时跳过评估，主分析仍可运行；完全 stripped 的输入会明确报错。
+
+### 单独执行某一阶段
+
+```bash
+uv run --locked ./pipeline/ssa.sh build/demo build/ssa-demo
+```
+
+阶段入口会重新执行必要的前置步骤，不会把旧 facts 当成已验证缓存。
+
+### 批量分析
+
+```bash
+uv run --locked ./pipeline/run_all.sh /path/to/binaries
+```
+
+批量入口分析目录第一层的 ELF 文件，使用默认入口 `main`。任一分析失败时，汇总失败数量并返回非零退出码。
+
+## 输出说明
+
+```text
+build/program-analysis/
+├── summary.json              # 输入 SHA256、阶段耗时、目标数与诊断摘要
+├── facts/                    # 中间关系与最终分析结果
+├── *.log                     # 各阶段日志
+└── evaluation/               # 启用 --compare 时生成
+    ├── gt_metadata.json
+    ├── stack_gt.tsv
+    ├── global_gt.tsv
+    └── report.txt            # 存在 DWARF 时生成的评估报告
+```
+
+| 文件（位于 `facts/`） | 含义 |
+| --- | --- |
+| `indirect_call_target.facts` | 调用点十进制地址、候选用户函数名 |
+| `external_call_target.facts` | 调用点地址、候选外部函数名 |
+| `call_graph.facts` | 调用者、被调函数、调用点地址 |
+| `interproc_edge.facts` | 过程间调用边与返回边 |
+| `ssa_def.facts` / `ssa_use.facts` | 寄存器定义版本与读取关系 |
+| `def_use.facts` | 定义版本到读取表达式的连接 |
+| `stack_aloc.facts` / `global_aloc.facts` / `heap_aloc.facts` | 三类抽象内存块 |
+| `points_to.facts` | 表达式可能指向的内存块 |
+| `memory_code.facts` / `memory_pointer.facts` | 块内的函数地址与指针 |
+| `store_to_aloc.facts` / `load_from_aloc.facts` | 内存访问与候选块的映射 |
+| `call_resolution.facts` | 所有可达间接调用点及其用户、外部目标数，保留空结果 |
+| `unresolved_call.facts` | 尚未解析出目标的间接调用点 |
+| `uncertain_call.facts` | 受 unknown 语义影响的调用点，可能已解析出部分目标 |
+| `unsupported.facts` | 尚未完整建模的语句或表达式 |
+
+facts 为无表头 TSV。空目标集应结合 `unresolved_call`、`uncertain_call` 和日志理解，不能据此认定运行时没有调用。完整字段定义见 [FACTS.md](docs/FACTS.md)。
+
+## 回归测试
+
+先安装前述 32 位开发库，再执行：
+
+```bash
+uv run --locked python tests/run_regressions.py
+```
+
+回归会实际编译、运行并分析 x86 / x64 样例，同时覆盖 AMD64 PIE。测试内容包括寄存器覆盖赋值、临时变量隔离、块内先读后写、偏移累计、内存别名、参数与返回值、间接工厂调用、全局初始化指针、堆回调、分支循环、PLT 和错误输入处理。
+
+逐案例结果保存到 `build/regressions/results.json`。寄存器与单参数回调案例检查目标集合精确相等；保守内存案例检查预期目标均被找到，并单独统计额外候选。详细基线记录见 [修复与验证记录](docs/REPAIR_VALIDATION.md)。
+
+## 使用 uv 管理环境
+
+| 文件 | 职责 |
+| --- | --- |
+| `.python-version` | 选择 Python `3.12` 系列 |
+| `pyproject.toml` | 声明 `>=3.12,<3.13` 与直接依赖约束 |
+| `uv.lock` | 锁定直接和传递依赖的具体版本；应提交到 Git |
+| `.venv/` | uv 创建的本地虚拟环境；不提交到 Git |
+| `requirements.txt` | 兼容导出；通过 uv 重新生成，不单独维护 |
+
+常用命令：
+
+```bash
+# 按锁文件重建/同步环境
+uv sync --locked
+
+# 查看实际解释器和依赖树
+uv run --locked python --version
+uv tree --locked
+
+# 在当前版本约束内更新依赖；更新后重新运行回归
+uv lock --upgrade
+uv sync --locked
+
+# 更新兼容依赖列表
+uv export --locked --no-hashes --no-emit-project \
+    --output-file requirements.txt
+```
+
+`.python-version` 的 `3.12` 固定主次版本，不固定补丁版本。若实验需精确复现某个补丁版本，可用 `uv python pin 3.12.15` 等命令写入完整版本号，并与 `pyproject.toml` 的范围保持一致。uv 的版本选择与锁定机制见 [官方项目指南](https://docs.astral.sh/uv/guides/projects/)。
+
+## 当前限制
+
+- 当前主要支持 Linux AMD64 / X86 ELF，依赖函数符号；完整 stripped 函数恢复尚未实现。
+- 寄存器区分定义版本；内存采用流不敏感弱更新，过程间分析上下文不敏感。
+- 默认每个函数一个栈帧块、每个全局 section 一个块；堆按识别出的分配调用点建块。该保守划分会合并对象或字段，产生额外候选。
+- X86 堆分配大小暂以 unknown 保留；仅有基础分配器与部分内存函数摘要。
+- 尚未完整覆盖 C++、异常、尾调用、全部 VEX 操作、库函数副作用、外部回调，以及动态分配器函数指针。
+- 回归结果只描述当前测试集。本项目是研究基线，尚不提供对任意二进制的 soundness 保证。
+
+## 进一步阅读
+
+- [环境配置与故障排查](docs/REQUIREMENTS.md)
+- [Facts schema v2](docs/FACTS.md)
+- [基线修复与验证记录](docs/REPAIR_VALIDATION.md)
+- [angr](https://angr.io/) · [Soufflé](https://souffle-lang.github.io/) · [uv](https://docs.astral.sh/uv/)
