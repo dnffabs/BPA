@@ -20,8 +20,23 @@ def write_rows(directory, relation, rows):
 
 
 def wrap(value, bits):
+    """Encode a scalar bitvector in Soufflé's signed 64-bit number domain.
+
+    A 32-bit address above 0x7fffffff must remain a positive address. Only
+    64-bit values need the signed encoding to fit in a Soufflé number.
+    """
     value &= (1 << bits) - 1
     return value - (1 << bits) if bits == 64 and value >= 1 << 63 else value
+
+
+def signed_displacement(value, bits):
+    """Interpret a modular address difference as a signed byte offset.
+
+    Keep this separate from scalar encoding: 0xfffffffc is a valid positive
+    32-bit absolute address, but adds -4 to a 32-bit stack pointer.
+    """
+    value &= (1 << bits) - 1
+    return value - (1 << bits) if value & (1 << (bits - 1)) else value
 
 
 def affine_values(directory, limit=8):
@@ -54,7 +69,7 @@ def affine_values(directory, limit=8):
                     queued.add(index)
 
     for eid, bits, value in read_rows(directory, "constant"):
-        update(int(eid), [("n", int(value))])
+        update(int(eid), [("n", wrap(int(value), int(bits)))])
     for eid, func in read_rows(directory, "stack_root"):
         update(int(eid), [("s", func, 0)])
     while queue:
@@ -64,7 +79,7 @@ def affine_values(directory, limit=8):
         if any(source in top for source in sources):
             update(dest, unknown=True)
             continue
-        candidates = set()
+        candidates, unknown = set(), False
         if kind == "copy":
             candidates.update(values[sources[0]])
         elif kind == "unary":
@@ -78,6 +93,10 @@ def affine_values(directory, limit=8):
                     candidates.add(("n", wrap(num, dest_bits)))
                 elif value[0] == "s" and cast and int(cast[3]) >= int(cast[1]):
                     candidates.add(value)
+                elif value[0] == "s":
+                    # Truncating a pointer (or applying an unsupported unary
+                    # operation) cannot preserve its exact entry-SP offset.
+                    unknown = True
         else:
             for left in values[sources[0]]:
                 for right in values[sources[1]]:
@@ -86,9 +105,20 @@ def affine_values(directory, limit=8):
                         if left[0] == right[0] == "n":
                             candidates.add(("n", wrap(left[1] + sign * right[1], bits)))
                         elif left[0] == "s" and right[0] == "n":
-                            candidates.add(("s", left[1], left[2] + sign * right[1]))
+                            offset = signed_displacement(left[2] + sign * right[1], bits)
+                            candidates.add(("s", left[1], offset))
                         elif sign == 1 and left[0] == "n" and right[0] == "s":
-                            candidates.add(("s", right[1], right[2] + left[1]))
+                            offset = signed_displacement(right[2] + left[1], bits)
+                            candidates.add(("s", right[1], offset))
+                    elif op.startswith("And") and (left[0] == "s" or right[0] == "s"):
+                        stack, mask = (left, right) if left[0] == "s" else (right, left)
+                        if mask[0] == "n" and signed_displacement(mask[1], bits) == -1:
+                            candidates.add(stack)
+                        else:
+                            # AND-based alignment depends on the unknown low
+                            # bits of entry SP. The main points-to analysis
+                            # still propagates the frame block through AND.
+                            unknown = True
                     elif left[0] == right[0] == "n":
                         a, b = left[1], right[1]
                         if op.startswith("And"):
@@ -99,11 +129,11 @@ def affine_values(directory, limit=8):
                             candidates.add(("n", wrap(a ^ b, bits)))
                         elif op.startswith("Mul"):
                             candidates.add(("n", wrap(a * b, bits)))
-        update(dest, candidates)
+        update(dest, candidates, unknown=unknown)
     return values, top
 
 
-def build(directory):
+def build(directory, memory_model="offset"):
     directory = Path(directory)
     metadata = json.loads((directory / "metadata.json").read_text())
     values, top = affine_values(directory)
@@ -164,5 +194,7 @@ def build(directory):
     first_arg = names.get("rdi", -1)
     write_rows(directory, "abi_first_arg", [(first_arg,)])
     write_rows(directory, "abi_second_arg", [(names.get("rsi", -1),)])
+    from offset_model import prepare
+    prepare(directory, values, top, memory_model)
     return {"widened_expressions": len(top), "stack_blocks": len(spans),
             "global_blocks": len(regions), "heap_blocks": len(heap)}

@@ -56,38 +56,10 @@ flow(a,b) :- unary(b,op,bits,a), pointer_width(w), bits >= w,
 code_value(e,a) :- scalar(e,a), function(_,a,_).
 code_value(e,a) :- scalar(e,a), external(a,_).
 code_value(b,a) :- flow(e,b), code_value(e,a).
-points_to(e,b) :- pointer_seed(e,b).
-points_to(e,b) :- scalar(e,a), global_aloc(b,start,size), a >= start, a < start+size.
-points_to(b,p) :- flow(e,b), points_to(e,p).
-points_to(e,b) :- binary(e,op,_,left,_),
-    (op = "Add64"; op = "Add32"; op = "Sub64"; op = "Sub32"; op = "And64"; op = "And32"), points_to(left,b).
-points_to(e,b) :- binary(e,op,_,_,right), (op = "Add64"; op = "Add32"), points_to(right,b).
-points_to(e,b) :- heap_result(s,e,b), external_edge(s,n), (n = "malloc"; n = "calloc"; n = "realloc").
+#include "offset_memory.dl"
 
 call_edge(s,g) :- call(s,f,_,_,e,_), reachable_func(f), code_value(e,a), function(g,a,_).
 external_edge(s,n) :- call(s,f,_,_,e,_), reachable_func(f), code_value(e,a), external(a,n).
-
-// Initial bytes are values of blocks, not executable-instruction constants.
-memory_code(b,a) :- global_word(loc,a), global_aloc(b,start,size), loc >= start, loc < start+size, function(_,a,_).
-memory_code(b,a) :- global_word(loc,a), global_aloc(b,start,size), loc >= start, loc < start+size, external(a,_).
-memory_pointer(b,p) :- global_word(loc,a), global_aloc(b,start,size), loc >= start, loc < start+size,
-    global_aloc(p,other,n), a >= other, a < other+n.
-// Flow-insensitive weak updates: all possible writes contribute to a block.
-memory_code(b,a) :- store(_,f,_,_,e,v), reachable_func(f), points_to(e,b), code_value(v,a).
-memory_pointer(b,p) :- store(_,f,_,_,e,v), reachable_func(f), points_to(e,b), points_to(v,p).
-code_value(v,a) :- load(_,f,_,_,e,v), reachable_func(f), points_to(e,b), memory_code(b,a).
-points_to(v,p) :- load(_,f,_,_,e,v), reachable_func(f), points_to(e,b), memory_pointer(b,p).
-// Conservative stack argument transfer (also covers x86 and AMD64 args > 6).
-// Whole-frame blocks intentionally sacrifice per-slot precision.
-memory_code(c,a) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_), stack_aloc(c,g,_,_), memory_code(b,a).
-memory_pointer(c,p) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_), stack_aloc(c,g,_,_), memory_pointer(b,p).
-.decl memory_transfer(dest:symbol, source:symbol)
-memory_transfer(dest,source) :- external_edge(s,"realloc"), call_input(s,r,a), abi_first_arg(r),
-    call_output(s,ret,result), abi_return(ret), points_to(a,source), points_to(result,dest).
-memory_transfer(dest,source) :- external_edge(s,n), (n = "memcpy"; n = "memmove"; n = "strcpy"),
-    call_input(s,r,a), abi_first_arg(r), call_input(s,q,b), abi_second_arg(q), points_to(a,dest), points_to(b,source).
-memory_code(dest,a) :- memory_transfer(dest,source), memory_code(source,a).
-memory_pointer(dest,p) :- memory_transfer(dest,source), memory_pointer(source,p).
 
 .decl store_to_aloc(instr:number, value:number, block:symbol)
 store_to_aloc(a,v,b) :- store(_,f,a,_,e,v), reachable_func(f), points_to(e,b).
@@ -117,10 +89,6 @@ unknown_value(e) :- binary(e,_,_,_,a), unknown_value(a).
 unknown_value(e) :- binary(e,_,_,a,_), code_value(a,_).
 unknown_value(e) :- binary(e,_,_,_,a), code_value(a,_).
 unknown_value(e) :- unary(e,_,bits,a), pointer_width(w), bits < w, code_value(a,_).
-.decl memory_unknown(block:symbol)
-memory_unknown(b) :- store(_,f,_,_,a,v), reachable_func(f), points_to(a,b), unknown_value(v).
-memory_unknown(b) :- memory_transfer(b,source), memory_unknown(source).
-unknown_value(v) :- load(_,f,_,_,a,v), reachable_func(f), points_to(a,b), memory_unknown(b).
 unknown_value(v) :- load(_,f,_,_,a,v), reachable_func(f), unknown_value(a).
 .decl uncertain_call(site:number)
 uncertain_call(a) :- call(_,f,_,a,e,1), reachable_func(f), unknown_value(e).

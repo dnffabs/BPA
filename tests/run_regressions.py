@@ -44,11 +44,11 @@ def fixture(name, data):
     return directory
 
 
-def run_rules(directory, analysis=False):
+def run_rules(directory, analysis=False, memory_model='offset'):
     souffle = find_souffle()
     datalog(directory, 'ssa.dl', souffle, 2, directory / 'ssa.log')
     if analysis:
-        build(directory)
+        build(directory, memory_model)
         for rule in ('stack_boundary.dl', 'global_boundary.dl', 'heap_boundary.dl', 'aloc_gen.dl', 'analysis.dl'):
             datalog(directory, rule, souffle, 2, directory / f'{rule}.log')
 
@@ -98,8 +98,11 @@ class SemanticRegressions(unittest.TestCase):
             'load': [(2, 'f', 120, 8, 21, 22)]})
         run_rules(path, analysis=True)
         self.assertIn(['21', 'f', '-24'], read_rows(path, 'affine_stack'))
-        self.assertIn(['22', '2000'], read_rows(path, 'code_value'))
+        self.assertNotIn(['22', '2000'], read_rows(path, 'code_value'))
         self.assertIn(['120', '22', 'stk_f'], read_rows(path, 'load_from_aloc'))
+        # The block baseline deliberately merges the two nonoverlapping slots.
+        run_rules(path, analysis=True, memory_model='block')
+        self.assertIn(['22', '2000'], read_rows(path, 'code_value'))
 
     def test_unary_temporary_and_block_namespace(self):
         import archinfo

@@ -1,0 +1,124 @@
+// Offsets are bytes relative to a block base. Unknown is tagged explicitly;
+// its numeric payload is always zero, never a sentinel that could alias -1.
+.decl memory_model(mode:symbol)
+.input memory_model
+.decl complete_value(eid:number)
+.input complete_value
+.decl offset_literal(eid:number, value:number)
+.input offset_literal
+.decl affine_stack(eid:number, func:symbol, offset:number)
+.input affine_stack
+.decl offset_enabled(block:symbol)
+offset_enabled(b) :- heap_aloc(b,_,_,_), memory_model(m), m != "block".
+offset_enabled(b) :- stack_aloc(b,_,_,_), memory_model("offset").
+offset_enabled(b) :- global_aloc(b,_,_), memory_model("offset").
+.decl points_to_offset(eid:number, block:symbol, kind:symbol, offset:number)
+.decl resolved_pointer(eid:number)
+resolved_pointer(e) :- complete_value(e), affine_stack(e,f,_), stack_aloc(b,f,_,_), offset_enabled(b).
+resolved_pointer(e) :- complete_value(e), scalar(e,a), global_aloc(b,s,n), a >= s, a < s+n, offset_enabled(b).
+points_to_offset(e,b,"exact",o-start) :- complete_value(e), affine_stack(e,f,o), stack_aloc(b,f,start,_), offset_enabled(b).
+points_to_offset(e,b,"unknown",0) :- pointer_seed(e,b), !resolved_pointer(e).
+points_to_offset(e,b,"exact",a-start) :- scalar(e,a), global_aloc(b,start,n), a >= start, a < start+n, offset_enabled(b).
+points_to_offset(e,b,"unknown",0) :- scalar(e,a), global_aloc(b,start,n), a >= start, a < start+n, !offset_enabled(b).
+points_to_offset(e,b,"exact",0) :- heap_result(s,e,b), external_edge(s,n),
+    (n = "malloc"; n = "calloc"; n = "realloc"), offset_enabled(b).
+points_to_offset(e,b,"unknown",0) :- heap_result(s,e,b), external_edge(s,n),
+    (n = "malloc"; n = "calloc"; n = "realloc"), !offset_enabled(b).
+points_to_offset(d,b,k,o) :- flow(s,d), points_to_offset(s,b,k,o), !resolved_pointer(d).
+
+// 0-base abstraction: one constant displacement from base zero is exact.
+// Further arithmetic on interior pointers widens, so cycles stay finite.
+// A literal zero is an identity (including on an interior pointer).
+.decl pointer_arithmetic(dest:number, base:number, displacement:number, sign:number)
+pointer_arithmetic(e,a,c,1) :- binary(e,op,_,a,c), (op = "Add64"; op = "Add32").
+pointer_arithmetic(e,a,c,1) :- binary(e,op,_,c,a), (op = "Add64"; op = "Add32").
+pointer_arithmetic(e,a,c,-1) :- binary(e,op,_,a,c), (op = "Sub64"; op = "Sub32").
+points_to_offset(e,b,"exact",sign*c) :- pointer_arithmetic(e,a,d,sign), offset_literal(d,c),
+    points_to_offset(a,b,"exact",0), !resolved_pointer(e).
+points_to_offset(e,b,"exact",o) :- pointer_arithmetic(e,a,d,_), offset_literal(d,0),
+    points_to_offset(a,b,"exact",o), !resolved_pointer(e).
+points_to_offset(e,b,"unknown",0) :- pointer_arithmetic(e,a,d,_), offset_literal(d,c), c != 0,
+    points_to_offset(a,b,"exact",o), o != 0, !resolved_pointer(e).
+points_to_offset(e,b,"unknown",0) :- pointer_arithmetic(e,a,d,_), !offset_literal(d,_),
+    points_to_offset(a,b,_,_), !resolved_pointer(e).
+points_to_offset(e,b,"unknown",0) :- pointer_arithmetic(e,a,_,_),
+    points_to_offset(a,b,"unknown",0), !resolved_pointer(e).
+points_to_offset(e,b,"unknown",0) :- binary(e,op,_,a,_), (op = "And64"; op = "And32"),
+    points_to_offset(a,b,_,_), !resolved_pointer(e).
+points_to_offset(e,b,"unknown",0) :- binary(e,op,_,_,a), (op = "And64"; op = "And32"),
+    points_to_offset(a,b,_,_), !resolved_pointer(e).
+
+.decl memory_code_offset(block:symbol, kind:symbol, offset:number, size:number, addr:number)
+.decl memory_pointer_offset(block:symbol, kind:symbol, offset:number, size:number, target:symbol, target_kind:symbol, target_offset:number)
+.decl memory_unknown_offset(block:symbol, kind:symbol, offset:number, size:number)
+.decl initial_location(block:symbol, kind:symbol, offset:number, address:number)
+initial_location(b,"exact",loc-start,loc) :- global_word(loc,_), global_aloc(b,start,n), loc >= start, loc < start+n, offset_enabled(b).
+initial_location(b,"unknown",0,loc) :- global_word(loc,_), global_aloc(b,start,n), loc >= start, loc < start+n, !offset_enabled(b).
+memory_code_offset(b,k,o,w/8,a) :- initial_location(b,k,o,loc), global_word(loc,a), function(_,a,_), pointer_width(w).
+memory_code_offset(b,k,o,w/8,a) :- initial_location(b,k,o,loc), global_word(loc,a), external(a,_), pointer_width(w).
+memory_pointer_offset(b,k,o,w/8,p,"exact",a-start) :- initial_location(b,k,o,loc), global_word(loc,a),
+    global_aloc(p,start,n), a >= start, a < start+n, offset_enabled(p), pointer_width(w).
+memory_pointer_offset(b,k,o,w/8,p,"unknown",0) :- initial_location(b,k,o,loc), global_word(loc,a),
+    global_aloc(p,start,n), a >= start, a < start+n, !offset_enabled(p), pointer_width(w).
+// Weak writes retain their actual location, not a summary fed back to reads.
+memory_code_offset(b,k,o,n,a) :- store(_,f,_,n,e,v), reachable_func(f), points_to_offset(e,b,k,o), code_value(v,a).
+memory_pointer_offset(b,k,o,n,p,pk,po) :- store(_,f,_,n,e,v), reachable_func(f),
+    points_to_offset(e,b,k,o), points_to_offset(v,p,pk,po).
+memory_unknown_offset(b,k,o,n) :- store(_,f,_,n,e,v), reachable_func(f), points_to_offset(e,b,k,o), unknown_value(v).
+// A short store cannot represent an entire pointer value.
+memory_unknown_offset(b,k,o,n) :- store(_,f,_,n,e,_), reachable_func(f), points_to_offset(e,b,k,o), pointer_width(w), n < w/8.
+
+.decl read_location(value:number, block:symbol, kind:symbol, offset:number, size:number)
+read_location(v,b,k,o,n) :- load(_,f,_,n,e,v), reachable_func(f), points_to_offset(e,b,k,o).
+.decl written_location(block:symbol, kind:symbol, offset:number, size:number)
+written_location(b,k,o,n) :- memory_code_offset(b,k,o,n,_).
+written_location(b,k,o,n) :- memory_pointer_offset(b,k,o,n,_,_,_).
+written_location(b,k,o,n) :- memory_unknown_offset(b,k,o,n).
+.decl read_overlap(value:number, block:symbol, kind:symbol, offset:number, size:number)
+read_overlap(v,b,k,o,n) :- read_location(v,b,"unknown",0,_), written_location(b,k,o,n).
+read_overlap(v,b,"unknown",0,n) :- read_location(v,b,_,_,_), written_location(b,"unknown",0,n).
+read_overlap(v,b,"exact",o,n) :- read_location(v,b,"exact",r,s), written_location(b,"exact",o,n), r < o+n, o < r+s.
+code_value(v,a) :- read_overlap(v,b,k,o,n), memory_code_offset(b,k,o,n,a).
+points_to_offset(v,p,pk,po) :- read_overlap(v,b,k,o,n), memory_pointer_offset(b,k,o,n,p,pk,po).
+unknown_value(v) :- read_overlap(v,b,k,o,n), memory_unknown_offset(b,k,o,n).
+unknown_value(v) :- read_location(v,_,_,_,n), pointer_width(w), n != w/8.
+// Reconstructing a pointer from partially overlapping bytes is not modeled.
+unknown_value(v) :- read_location(v,b,"exact",r,s), read_overlap(v,b,"exact",o,n), (r != o; s != n).
+// An unknown byte position can also partially overlap a pointer. Preserve
+// candidates, but record that complete pointer reconstruction is uncertain.
+unknown_value(v) :- read_location(v,b,"unknown",0,_), read_overlap(v,b,_,_,_), offset_enabled(b).
+unknown_value(v) :- read_overlap(v,b,"unknown",0,_), offset_enabled(b).
+
+// Without exact caller SP mapping, aggregate caller frame contents only into
+// callee argument slots that may be read. Unknown-offset reads fall back to
+// the whole callee frame. Loads through escaped argument-slot addresses count.
+.decl stack_argument_slot(stmt:number, caller_block:symbol, callee_block:symbol, kind:symbol, offset:number, size:number)
+stack_argument_slot(s,b,c,"exact",o,n) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_),
+    stack_aloc(c,g,start,_), read_location(_,c,"exact",o,n), pointer_width(w), o+start >= w/8.
+stack_argument_slot(s,b,c,"unknown",0,n) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_),
+    stack_aloc(c,g,_,_), read_location(_,c,"unknown",0,n).
+memory_code_offset(c,k,o,n,a) :- stack_argument_slot(_,b,c,k,o,n), memory_code_offset(b,_,_,_,a).
+memory_pointer_offset(c,k,o,n,p,pk,po) :- stack_argument_slot(_,b,c,k,o,n), memory_pointer_offset(b,_,_,_,p,pk,po).
+memory_unknown_offset(c,k,o,n) :- stack_argument_slot(_,b,c,k,o,n), memory_unknown_offset(b,_,_,_).
+
+// Library summaries conservatively widen the destination offset. Pointer
+// values being copied still retain their target offsets. Byte counts and
+// realloc's preserved prefix are not yet modeled precisely.
+.decl memory_transfer(dest:symbol, source:symbol)
+memory_transfer(dest,source) :- external_edge(s,"realloc"), call_input(s,r,a), abi_first_arg(r),
+    call_output(s,ret,result), abi_return(ret), points_to(a,source), points_to(result,dest).
+memory_transfer(dest,source) :- external_edge(s,n), (n = "memcpy"; n = "memmove"; n = "strcpy"),
+    call_input(s,r,a), abi_first_arg(r), call_input(s,q,b), abi_second_arg(q), points_to(a,dest), points_to(b,source).
+memory_code_offset(dest,"unknown",0,n,a) :- memory_transfer(dest,source), memory_code_offset(source,_,_,n,a).
+memory_pointer_offset(dest,"unknown",0,n,p,pk,po) :- memory_transfer(dest,source), memory_pointer_offset(source,_,_,n,p,pk,po).
+memory_unknown_offset(dest,"unknown",0,n) :- memory_transfer(dest,source), memory_unknown_offset(source,_,_,n).
+
+// Compatibility projections are outputs/summary inputs only, never used to
+// join ordinary memory reads with writes.
+points_to(e,b) :- points_to_offset(e,b,_,_).
+memory_code(b,a) :- memory_code_offset(b,_,_,_,a).
+memory_pointer(b,p) :- memory_pointer_offset(b,_,_,_,p,_,_).
+.output points_to_offset(filename="points_to_offset.facts")
+.output memory_code_offset(filename="memory_code_offset.facts")
+.output memory_pointer_offset(filename="memory_pointer_offset.facts")
+.output memory_unknown_offset(filename="memory_unknown_offset.facts")
