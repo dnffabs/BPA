@@ -1,8 +1,10 @@
-# 从内存分块到间接调用目标：当前算法的逐步推导
+# 从内存分块到间接调用目标：块级基线的逐步推导
 
-本文用一个小程序说明：**当前仓库如何把二进制中的地址读写，逐步转成“这个间接调用可能调用哪些函数”。**
+本文用一个小程序说明：**仓库的块级基线如何把二进制中的地址读写，逐步转成“这个间接调用可能调用哪些函数”。**
 
-内容按本仓库当前的 Python 和 Datalog 实现核对，使用 facts schema v2；样例在 2026-10-20 实际编译、运行并分析。它描述的是本项目的现有实现，不能直接等同于 BPA / BPA-X 论文的全部算法和能力。
+本文记录 2026-10-20 的块级基线，使用 facts schema v2。下文的“当前实现”与 facts 实测均指该基线，不能直接等同于 BPA / BPA-X 论文的全部算法和能力。
+
+**2026-10-26 更新：默认模式已加入块内偏移，本文的块内容合并规则用 `--memory-model block` 对照。最新的读写关系、栈参数处理、字段区分及实测见 [OFFSET_ANALYSIS.md](OFFSET_ANALYSIS.md)。基础的定义版本、种子和调用图不动点流程仍可按本文学习。**
 
 建议第一次按第 1～10 节阅读，先理解主线；再看实际 facts、精度损失与代码定位。
 
@@ -766,6 +768,7 @@ gcc -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer \
 echo $?   # 分配成功且行为正确时为 0
 
 uv run --locked ./pipeline/run.sh build/walkthrough/basic \
+    --memory-model block \
     --output build/walkthrough/basic-analysis
 
 cat build/walkthrough/basic-analysis/summary.json
@@ -948,6 +951,7 @@ gcc -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer -DOVERWRITE \
 echo $?   # 本次为 0，说明实际调用结果是 bye 返回的 9
 
 uv run --locked ./pipeline/run.sh build/walkthrough/overwrite \
+    --memory-model block \
     --output build/walkthrough/overwrite-analysis
 
 cat build/walkthrough/overwrite-analysis/facts/indirect_call_target.facts

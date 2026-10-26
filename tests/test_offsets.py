@@ -26,6 +26,22 @@ BETA = 'offset_beta'
 BOTH = {ALPHA, BETA}
 MODES = ('block', 'heap-offset', 'offset')
 RESULTS = []
+EXPECTED_ANALYSES = 27
+
+
+def mode_totals(mode):
+    cases = [result for result in RESULTS if result['mode'] == mode]
+    totals = {key: sum(result[key] for result in cases)
+              for key in ('TP', 'FP', 'FN', 'indirect_edges', 'elapsed_seconds')}
+    peaks = [result['analysis_resources']['peak_rss_kib'] for result in cases
+             if result['analysis_resources']['peak_rss_kib'] is not None]
+    totals.update({
+        'analyses': len(cases),
+        'sites': sum(len(result['sites']) for result in cases),
+        'solver_wall_seconds': round(sum(result['analysis_resources']['wall_seconds'] for result in cases), 4),
+        'max_solver_peak_rss_kib': max(peaks) if peaks else None,
+    })
+    return totals
 
 
 def command(args, log, timeout=120):
@@ -48,12 +64,14 @@ class OffsetEndToEndTests(unittest.TestCase):
     def tearDownClass(cls):
         # Keep successful evidence even if a later case exposes a regression.
         (OUTPUT / 'results.json').write_text(json.dumps({
+            'status': ('completed' if len(RESULTS) == EXPECTED_ANALYSES
+                       and all(result['checks_passed'] for result in RESULTS)
+                       else 'incomplete_or_failed'),
+            'expected_analyses': EXPECTED_ANALYSES,
+            'completed_analyses': len(RESULTS),
             'measurement': 'fixture indirect-call targets; elapsed pipeline wall time',
             'cases': RESULTS,
-            'totals': {mode: {
-                key: sum(result[key] for result in RESULTS if result['mode'] == mode)
-                for key in ('TP', 'FP', 'FN', 'indirect_edges', 'elapsed_seconds')
-            } for mode in MODES},
+            'totals': {mode: mode_totals(mode) for mode in MODES},
         }, indent=2) + '\n')
 
     def run_case(self, name, truth, expected, architectures=(64, 32)):
@@ -97,12 +115,14 @@ class OffsetEndToEndTests(unittest.TestCase):
                                         'expected_native': sorted(native_targets),
                                         'actual': sorted(actual)})
                     report = {'case': name, 'bits': bits, 'mode': mode, 'native_exit': 0,
+                              'checks_passed': False,
                               'TP': tp, 'FP': fp, 'FN': fn,
                               'indirect_edges': sum(len(t) for t in targets.values()),
                               'call_graph_edges': len(rows(facts, 'call_graph')),
                               'points_to_offset_rows': len(rows(facts, 'points_to_offset')),
                               'memory_code_offset_rows': len(rows(facts, 'memory_code_offset')),
                               'analysis_resources': summary['analysis_resources'],
+                              'uncertain_calls': summary['uncertain_calls'],
                               'elapsed_seconds': round(elapsed, 4),
                               'sites': entries, 'summary': str(analysis / 'summary.json')}
                     RESULTS.append(report)
@@ -134,6 +154,7 @@ class OffsetEndToEndTests(unittest.TestCase):
                                              and r[5] == 'exact' and int(r[6]) == bits // 8]
                         self.assertTrue(interior_pointers,
                                         'heap-stored interior pointer lost its target offset')
+                    report['checks_passed'] = True
 
     def test_separate_fields(self):
         truth = {name: {ALPHA} for name in ('heap_fields', 'stack_fields', 'global_fields')}

@@ -34,19 +34,38 @@ def find_souffle():
     raise ValueError("Souffle not found; set SOUFFLE=/path/to/souffle")
 
 
+def measured_command(command, log):
+    """Measure the executed command, without inheriting this Python's RSS peak.
+
+    wait4 immediately after forking angr's Python process also counts its
+    pre-exec memory. GNU time starts a small, separately executed parent before
+    launching the solver. Missing optional time means RSS is unavailable.
+    """
+    timer = Path("/usr/bin/time")
+    rss_file = log.with_suffix(".rss_kib")
+    if rss_file.exists():
+        rss_file.unlink()
+    timed = timer.is_file()
+    if timed:
+        command = [str(timer), "-q", "-f", "%M", "-o", str(rss_file), *command]
+    start = time.monotonic()
+    with log.open("w") as stream:
+        process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
+    peak = int(rss_file.read_text().strip()) if timed and rss_file.is_file() else None
+    return process.returncode, {
+        "wall_seconds": round(time.monotonic() - start, 4),
+        "peak_rss_kib": peak,
+        "rss_method": "gnu-time" if timed else "unavailable",
+        "rss_scope": "solver command including preprocessor" if timed else None,
+    }
+
+
 def datalog(facts, name, souffle, jobs, log):
     command = [souffle, "-w", "-j", str(jobs), "-F", str(facts), "-D", str(facts), str(ROOT / "rules" / name)]
-    start = time.monotonic()
-    # Linux wait4 returns this solver process's peak RSS, rather than the
-    # cumulative maximum of all earlier subprocesses in the pipeline.
-    with log.open("w") as stream:
-        with subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT) as process:
-            _, status, usage = os.wait4(process.pid, 0)
-            process.returncode = os.waitstatus_to_exitcode(status)
-    if process.returncode:
-        raise RuntimeError(f"{name} failed (exit {process.returncode}); {log}\n{log.read_text()}")
-    return {"wall_seconds": round(time.monotonic() - start, 4),
-            "peak_rss_kib": usage.ru_maxrss}
+    returncode, resources = measured_command(command, log)
+    if returncode:
+        raise RuntimeError(f"{name} failed (exit {returncode}); {log}\n{log.read_text()}")
+    return resources
 
 
 def run(args):
