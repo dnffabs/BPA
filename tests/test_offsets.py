@@ -26,7 +26,7 @@ BETA = 'offset_beta'
 BOTH = {ALPHA, BETA}
 MODES = ('block', 'heap-offset', 'offset')
 RESULTS = []
-EXPECTED_ANALYSES = 27
+EXPECTED_ANALYSES = 33
 
 
 def mode_totals(mode):
@@ -147,7 +147,7 @@ class OffsetEndToEndTests(unittest.TestCase):
                         unknown_heap = [r for r in rows(facts, 'points_to_offset')
                                         if r[1].startswith('heap_') and r[2] == 'unknown']
                         self.assertTrue(unknown_heap, 'loop-carried pointer must widen its offset')
-                    if name == 'interproc' and mode != 'block' and bits == 64:
+                    if name == 'interproc' and mode == 'offset':
                         interior_pointers = [r for r in rows(facts, 'memory_pointer_offset')
                                              if r[0].startswith('heap_')
                                              and r[4].startswith('heap_')
@@ -187,10 +187,15 @@ class OffsetEndToEndTests(unittest.TestCase):
         def expected(function, mode, bits):
             if mode == 'block':
                 return BOTH, True
-            # x86 stack arguments still use conservative frame transfer.
-            return {BETA}, bits == 64 and mode == 'offset'
+            return {BETA}, mode == 'offset'
 
         self.run_case('interproc', {'invoke_slot': {BETA}}, expected)
+
+    def test_stack_argument_positions(self):
+        truth = {'select_first': {ALPHA}, 'select_second': {BETA},
+                 'many_first': {ALPHA}, 'many_second': {BETA}}
+        self.run_case('stack_arguments', truth,
+                      lambda function, mode, bits: (truth[function], mode == 'offset'))
 
 
 if __name__ == '__main__':

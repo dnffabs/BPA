@@ -67,6 +67,7 @@ class VexParser:
         self.expression_counter, self.address = 0, block.addr
         last = block.instruction_addrs[-1]
         is_call = self.irsb.jumpkind == "Ijk_Call"
+        call_sp_after = None
         for order, stmt in enumerate(self.irsb.statements, 1):
             self.order = order
             if stmt.tag == "Ist_IMark":
@@ -81,6 +82,10 @@ class VexParser:
                 loc, width = self.reg(stmt.offset, max(1, bits // 8))
                 # CALL's hardware push is undone before its FakeRet successor.
                 if is_call and self.address == last and loc == self.arch.sp_offset:
+                    # VEX can delay an earlier AND/subtraction into this Put.
+                    # Keep the actual expression, then undo only the hardware
+                    # push; dropping the whole Put would lose software changes.
+                    call_sp_after = self.expr(stmt.data)
                     continue
                 value = self.expr(stmt.data)
                 definition = self.facts.eid(("definition", self.stmt, loc))
@@ -105,6 +110,16 @@ class VexParser:
         self.facts.add("statement", self.stmt, function, self.bb, last, self.order)
         target = self.expr(self.irsb.next)
         if is_call:
+            if call_sp_after is not None:
+                snapshot = self.facts.eid(("call_stack", self.stmt))
+                word = self.facts.eid(("call_stack_word", self.stmt))
+                self.facts.add("constant", word, self.arch.bits, self.arch.bytes)
+                self.facts.add("binary", snapshot, f"Add{self.arch.bits}", self.arch.bits, call_sp_after, word)
+                self.facts.add("call_stack", self.stmt, snapshot)
+                version = self.facts.eid(("call_stack_definition", self.stmt))
+                self.facts.add("reg_def", self.stmt, function, self.bb, self.order,
+                               self.arch.sp_offset, snapshot, version)
+                self.facts.add("copy", snapshot, version)
             machine = block.capstone.insns[-1].insn
             indirect = int(not machine.operands or machine.operands[0].type != 2)
             self.facts.add("call", self.stmt, function, self.bb, last, target, indirect)

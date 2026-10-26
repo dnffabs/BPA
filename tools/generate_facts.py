@@ -14,7 +14,7 @@ from vex2Datalog.parser import VexParser
 INPUTS = ("function", "block", "edge", "entry_reg", "register", "statement", "temporary",
           "reg_def", "reg_read", "copy", "constant", "binary", "unary", "load", "store",
           "call", "call_input", "call_output", "return_block", "global_region", "global_word",
-          "external", "root", "stack_root", "unknown_seed", "unsupported")
+          "external", "root", "stack_root", "unknown_seed", "unsupported", "call_stack")
 GENERAL = {"AMD64": ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rsp", "rbp",
                      "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"),
            "X86": ("eax", "ebx", "ecx", "edx", "esi", "edi", "esp", "ebp")}
@@ -79,7 +79,14 @@ def generate(binary_path, output_dir, entry="main"):
             facts.add("entry_reg", name, loc, version)
             if loc == arch.sp_offset:
                 facts.add("stack_root", version, name)
+    captured_stack = {row[0] for row in facts.rows["call_stack"]}
     for call_stmt, name, bb, address, order in calls:
+        # Snapshot SP before CALL's hardware return-address push. It is a
+        # coordinate for stack arguments, not a register actual/formal edge.
+        if call_stmt not in captured_stack:
+            stack_snapshot = facts.eid(("call_stack", call_stmt))
+            facts.add("reg_read", call_stmt, name, bb, order + 1, arch.sp_offset, stack_snapshot)
+            facts.add("call_stack", call_stmt, stack_snapshot)
         for loc in sorted(general - {arch.sp_offset}):
             snapshot = facts.eid(("argument", call_stmt, loc))
             facts.add("reg_read", call_stmt, name, bb, order + 1, loc, snapshot)

@@ -1,8 +1,8 @@
-# Facts schema v2 与 offset 扩展 v1
+# Facts schema v2 与 offset 扩展 v2
 
 所有文件为 UTF-8 TSV，无表头。数值地址为 CLE 加载后的虚拟地址；ELF PIE 的符号、指令、全局数据和重定位指针使用同一 load bias。位宽以 bits 表示，内存访问宽度/块大小以 bytes 表示。Python 转换器见 `tools/vex2Datalog/parser.py`，Datalog 声明见 `rules/schema.dl`。
 
-原始前端仍使用 schema v2；偏移规则的输入输出在 `rules/offset_memory.dl` 声明，`summary.json` 额外记录 `offset_schema: 1` 和 `memory_model`。旧 facts 目录需重新执行流水线，生成新扩展所需输入。
+原始前端使用 schema v2；扩展 v2 增加调用点 SP 与栈写入快照，`summary.json` 记录 `offset_schema: 2` 和 `memory_model`。旧 facts 目录需重新执行流水线，生成新扩展所需输入。
 
 ## 身份
 
@@ -25,6 +25,7 @@
 | load | stmt, function, machine_address, bytes, address_eid, result_eid |
 | store | stmt, function, machine_address, bytes, address_eid, value_eid |
 | call | stmt, caller_function, bb, machine_address, target_expression_eid, machine_is_indirect |
+| call_stack | call_stmt, before_call_sp_expression_eid |
 
 `IRSB.next` 通过同一个表达式转换器生成 `call.target_expression_eid`。机器调用类型根据反汇编的操作数判断，保留被 VEX 常量折叠的寄存器间接调用。
 
@@ -32,7 +33,9 @@
 
 `ssa.dl` 输出 `def_use(definition_version, read_expression)`。局部选择的是使用之前最近的定义；没有较早定义时使用入口到达定义，即使块内后面还有写入。分支汇合可有多个输入定义，不需要把指令地址伪装成表达式 ID。
 
-每个调用记录 `call_input(stmt, register, snapshot_eid)`。在调用之后为 caller-saved 寄存器增加独立的虚拟返回/覆盖定义，callee-saved 寄存器沿 FakeRet 边保留原定义。CALL 的硬件压入返回地址不作为调用者帧的持久 SP 变化。
+每个调用记录 `call_input(stmt, register, snapshot_eid)`。在调用之后为 caller-saved 寄存器增加独立的虚拟返回/覆盖定义，callee-saved 寄存器沿 FakeRet 边保留原定义。
+
+`call_stack` 单独记录硬件压入返回地址**之前**的 SP，不作为普通参数传递。VEX 可能将软件对齐/减法延迟到 CALL 的最终 SP 写入：转换器保留该表达式，加回一个机器字抵消硬件压栈，并为调用者 SP 建立恢复后的定义，供 FakeRet 后继续使用。不能直接删除整个最终 SP 写入，否则会丢失软件调整。
 
 核心规则递归生成 `call_edge`，将参数 snapshot 连接到被调函数入口、返回寄存器连接到调用后的结果版本。由此得到的用户调用图和过程间边在同一次 Soufflé 最小不动点中更新。
 
@@ -55,6 +58,10 @@
 | `complete_value` | eid：通过预分析完整性认证的表达式 |
 | `offset_literal` | eid, signed_displacement：已认证的字面常量位移 |
 | `affine_stack` | eid, function, entry_sp_offset：预分析得到的可能栈偏移，仅已认证的表达式可精确播种 |
+| `call_stack_offset` | call_stmt, entry_sp_offset：认证的调用前 SP 偏移，可能有多个完整备选 |
+| `certified_stack_store` | store_stmt, entry_sp_offset：地址完整且全部属于当前函数帧的原生写入位置 |
+| `call_stack_snapshot` | call_stmt：已根据语句顺序及函数内 CFG 生成栈写入快照的调用点 |
+| `call_stack_store` | call_stmt, store_stmt：仍有字节可能到达该调用的已认证写入 |
 
 完整性认证不会凭空完善预分析；它让不完整结果继续走保守传播。跨函数传入的整数位移暂不作为动态 0-base 精确位移，未识别为字面常量时降级。
 
@@ -66,6 +73,7 @@
 | `memory_code_offset` | block, kind, offset, size_bytes, code_address |
 | `memory_pointer_offset` | block, kind, offset, size_bytes, target_block, target_kind, target_offset |
 | `memory_unknown_offset` | block, kind, offset, size_bytes |
+| `stack_argument_map` | call_stmt, source_block, source_kind, source_offset, source_size, dest_block, dest_kind, dest_offset, dest_size, mode |
 
 `kind` / `target_kind` 为 `exact` 或 `unknown`。`exact, 8` 表示精确字节偏移 8；`unknown, 0` 中的 0 只是规范化占位，表示块内任何位置，不能当成精确偏移 0。负数是合法偏移，不用 `-1` 表示未知。
 
@@ -77,6 +85,12 @@
 
 ### 栈参数与内存函数摘要
 
-寄存器实参、返回值和内存中保存的数据指针传递完整的 `block,kind,offset`。栈参数按被调函数 entry-SP 加一个机器字及以上的可读位置接收调用者帧内容；未知栈位置读取触发整帧退化。该摘要也考虑槽地址逃逸到其它函数后的读取。它尚未恢复调用者和被调者之间逐槽的精确地址映射。
+寄存器实参、返回值和内存中保存的数据指针传递完整的 `block,kind,offset`。默认 `offset` 模式对认证 SP 做坐标换算：若调用前 SP 为调用者 entry-SP 的 `d`，某写入为 `x`，则其被调者 entry-SP 偏移为 `x-d+word_size`。换成块内坐标时再加调用者块起点、减被调者块起点。
+
+映射保留源写入宽度，并只物化与实际参数读取区间重叠的位置，避免递归调用产生无限位移。槽地址逃逸到其它函数后的读取也参与需求匹配。`stack_argument_map.mode` 为 `exact`、`unknown-source`、`unknown-sp` 或 `unknown-destination`。
+
+已认证的本地栈写入使用 `call_stack_store` 选取调用点的到达值：单一确定地址的写入按字节覆盖旧定义，模糊地址只做弱合并，分支路径取并集。动态/外来别名、输入参数区域和未知内存内容保守保留。这只细化栈传参，不改变普通堆/全局内存的流不敏感模型；不同调用点仍共享被调函数入口。
+
+未知 SP、未认证写入或未知目标位置保留回退，相关未知性可传播到 `uncertain_call`。详细推导及复用槽例子见 [STACK_ARGUMENTS.md](STACK_ARGUMENTS.md)。
 
 `memcpy` / `memmove` / `strcpy` / `realloc` 复制摘要把目的存储位置退化为 `unknown`，但保留所复制指针的目标偏移，并传播内存未知内容；复制长度、目的位移平移、`realloc` 保留前缀尚未精确建模。

@@ -72,3 +72,16 @@ def prepare(directory, values, top, mode):
                ((int(eid), signed_displacement(int(value), int(bits)))
                 for eid, bits, value in read_rows(directory, 'constant')
                 if int(eid) in complete))
+    callers = {int(row[0]): row[1] for row in read_rows(directory, 'call')}
+    call_offsets = []
+    for stmt, expression in read_rows(directory, 'call_stack'):
+        stmt, expression = int(stmt), int(expression)
+        candidates = values.get(expression, set())
+        # All alternatives must be offsets in this caller's own frame. A
+        # partial set, scalar SP, or foreign frame requires the fallback.
+        if (expression in complete and candidates and stmt in callers
+                and all(value[0] == 's' and value[1] == callers[stmt] for value in candidates)):
+            call_offsets.extend((stmt, value[2]) for value in candidates)
+    write_rows(directory, 'call_stack_offset', call_offsets)
+    from stack_arguments import prepare as prepare_stack_arguments
+    prepare_stack_arguments(directory, values, complete)

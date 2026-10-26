@@ -18,7 +18,7 @@ class StackDisplacements(unittest.TestCase):
         inputs = ("copy", "def_use", "binary", "unary", "constant", "stack_root",
                   "function", "load", "store", "global_region", "register",
                   "call_input", "call_output", "external", "call",
-                  "unknown_seed", "entry_reg")
+                  "unknown_seed", "entry_reg", "call_stack", "statement", "block", "edge")
         for name in inputs:
             write_rows(path, name, relations.get(name, []))
         (path / "metadata.json").write_text(json.dumps({

@@ -89,17 +89,74 @@ unknown_value(v) :- read_location(v,b,"exact",r,s), read_overlap(v,b,"exact",o,n
 unknown_value(v) :- read_location(v,b,"unknown",0,_), read_overlap(v,b,_,_,_), offset_enabled(b).
 unknown_value(v) :- read_overlap(v,b,"unknown",0,_), offset_enabled(b).
 
-// Without exact caller SP mapping, aggregate caller frame contents only into
-// callee argument slots that may be read. Unknown-offset reads fall back to
-// the whole callee frame. Loads through escaped argument-slot addresses count.
+// Stack coordinates: caller entry SP = S, before-call SP = S+d.
+// Callee entry SP is S+d-word, so a caller offset x maps to x-d+word.
+.decl call_stack_offset(stmt:number, offset:number)
+.input call_stack_offset
+.decl precise_stack_call(stmt:number)
+precise_stack_call(s) :- call_stack_offset(s,_), memory_model("offset").
 .decl stack_argument_slot(stmt:number, caller_block:symbol, callee_block:symbol, kind:symbol, offset:number, size:number)
+// Include a wide read straddling the return-address/argument boundary.
+// Read locations may be in another function after a slot address escapes.
 stack_argument_slot(s,b,c,"exact",o,n) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_),
-    stack_aloc(c,g,start,_), read_location(_,c,"exact",o,n), pointer_width(w), o+start >= w/8.
+    stack_aloc(c,g,start,_), read_location(_,c,"exact",o,n), pointer_width(w), o+start+n > w/8.
 stack_argument_slot(s,b,c,"unknown",0,n) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_),
     stack_aloc(c,g,_,_), read_location(_,c,"unknown",0,n).
-memory_code_offset(c,k,o,n,a) :- stack_argument_slot(_,b,c,k,o,n), memory_code_offset(b,_,_,_,a).
-memory_pointer_offset(c,k,o,n,p,pk,po) :- stack_argument_slot(_,b,c,k,o,n), memory_pointer_offset(b,_,_,_,p,pk,po).
-memory_unknown_offset(c,k,o,n) :- stack_argument_slot(_,b,c,k,o,n), memory_unknown_offset(b,_,_,_).
+
+.decl stack_argument_map(stmt:number, source:symbol, source_kind:symbol, source_offset:number, source_size:number,
+    dest:symbol, dest_kind:symbol, dest_offset:number, dest_size:number, mode:symbol)
+// Bound materialized offsets to an actual read range. Translating all writes
+// without this guard would generate unbounded offsets on recursive calls.
+stack_argument_map(s,b,"exact",o,n,c,"exact",mapped,n,"exact") :-
+    stack_argument_slot(s,b,c,"exact",r,rn), precise_stack_call(s), call_stack_offset(s,d),
+    stack_aloc(b,_,bs,_), stack_aloc(c,_,cs,_), pointer_width(w),
+    written_location(b,"exact",o,n), mapped = bs+o-d+w/8-cs,
+    mapped < r+rn, r < mapped+n.
+// Unknown write positions can reach every candidate argument slot.
+stack_argument_map(s,b,"unknown",0,n,c,"exact",r,rn,"unknown-source") :-
+    stack_argument_slot(s,b,c,"exact",r,rn), precise_stack_call(s), written_location(b,"unknown",0,n).
+// Unknown SP never silently drops a source; it retains the coarse summary.
+stack_argument_map(s,b,k,o,n,c,"exact",r,rn,"unknown-sp") :-
+    stack_argument_slot(s,b,c,"exact",r,rn), !precise_stack_call(s), written_location(b,k,o,n).
+// An unknown destination read also requires a finite, unknown-location map.
+stack_argument_map(s,b,k,o,n,c,"unknown",0,rn,"unknown-destination") :-
+    stack_argument_slot(s,b,c,"unknown",0,rn), written_location(b,k,o,n).
+
+.decl certified_stack_store(stmt:number, offset:number)
+.input certified_stack_store
+.decl call_stack_snapshot(stmt:number)
+.input call_stack_snapshot
+.decl call_stack_store(call_stmt:number, store_stmt:number)
+.input call_stack_store
+
+// Only certified local writes use the call-site reaching-write snapshot.
+// Unknown locations/SP, incoming argument memory, and dynamic/foreign aliases
+// stay conservative. Numeric coordinates alone do not distinguish slot reuse.
+.decl stack_argument_memory_source(stmt:number, block:symbol, kind:symbol, offset:number, size:number)
+stack_argument_memory_source(s,b,k,o,n) :- stack_argument_map(s,b,k,o,n,_,_,_,_,mode), mode != "exact".
+stack_argument_memory_source(s,b,k,o,n) :- stack_argument_map(s,b,k,o,n,_,_,_,_,_), !call_stack_snapshot(s).
+stack_argument_memory_source(s,b,"exact",o,n) :- stack_argument_map(s,b,"exact",o,n,_,_,_,_,_),
+    stack_aloc(b,_,start,_), pointer_width(w), o+start >= w/8.
+
+.decl stack_argument_value(stmt:number, block:symbol, kind:symbol, offset:number, size:number, value:number)
+stack_argument_value(s,b,"exact",offset-start,n,v) :- call_stack_snapshot(s), call_stack_store(s,t),
+    certified_stack_store(t,offset), store(t,f,_,n,_,v), stack_aloc(b,f,start,_).
+// These writes cannot be strongly killed by the scalar/affine prepass.
+stack_argument_value(s,b,k,o,n,v) :- call_stack_snapshot(s), stack_argument_map(s,b,k,o,n,_,_,_,_,_),
+    store(t,f,_,n,e,v), reachable_func(f), !certified_stack_store(t,_), points_to_offset(e,b,k,o).
+
+memory_code_offset(c,dk,d,dn,a) :- stack_argument_map(s,b,k,o,n,c,dk,d,dn,_),
+    stack_argument_memory_source(s,b,k,o,n), memory_code_offset(b,k,o,n,a).
+memory_pointer_offset(c,dk,d,dn,p,pk,po) :- stack_argument_map(s,b,k,o,n,c,dk,d,dn,_),
+    stack_argument_memory_source(s,b,k,o,n), memory_pointer_offset(b,k,o,n,p,pk,po).
+memory_code_offset(c,dk,d,dn,a) :- stack_argument_map(s,b,k,o,n,c,dk,d,dn,_),
+    stack_argument_value(s,b,k,o,n,v), code_value(v,a).
+memory_pointer_offset(c,dk,d,dn,p,pk,po) :- stack_argument_map(s,b,k,o,n,c,dk,d,dn,_),
+    stack_argument_value(s,b,k,o,n,v), points_to_offset(v,p,pk,po).
+// Unknown contents are retained even if their source may be overwritten.
+memory_unknown_offset(c,dk,d,dn) :- stack_argument_map(_,b,k,o,n,c,dk,d,dn,_), memory_unknown_offset(b,k,o,n).
+memory_unknown_offset(c,dk,d,dn) :- stack_argument_map(_,_,_,_,_,c,dk,d,dn,mode), mode != "exact", offset_enabled(c).
+.output stack_argument_map(filename="stack_argument_map.facts")
 
 // Library summaries conservatively widen the destination offset. Pointer
 // values being copied still retain their target offsets. Byte counts and

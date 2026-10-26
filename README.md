@@ -2,7 +2,7 @@
 
 面向 ELF 二进制的块级指针分析研究原型：通过 **angr / VEX IR** 提取程序语义，使用 **Soufflé Datalog** 联合求解指针值传播、过程间调用关系与间接调用目标。
 
-项目采用 BPA / BPA-X 的内存块分析思路，并加入 BinPointer 启发的 **0-base 块内偏移分析**。默认跟踪“块＋偏移”，同时提供块级基线作对照。当前使用 **facts schema v2＋offset 扩展 v1**，Python 环境与依赖由 **uv** 管理。
+项目采用 BPA / BPA-X 的内存块分析思路，并加入 BinPointer 启发的 **0-base 块内偏移分析**。默认跟踪“块＋偏移”，同时提供块级基线作对照。当前使用 **facts schema v2＋offset 扩展 v2**，Python 环境与依赖由 **uv** 管理。
 
 [环境要求](#环境要求) · [快速开始](#快速开始) · [算法逐步推导](docs/ALGORITHM_WALKTHROUGH.md) · [偏移分析与实测](docs/OFFSET_ANALYSIS.md) · [项目结构](#项目结构) · [使用方法](#使用方法) · [输出说明](#输出说明) · [回归测试](#回归测试) · [当前限制](#当前限制)
 
@@ -11,7 +11,7 @@
 - **统一中间表示**：将 VEX 中的寄存器读写、内存访问、表达式与调用目标转换为 TSV facts。
 - **寄存器定义追踪**：按基本块和 VEX 语句顺序建立定义与读取关系，区分覆盖赋值前后的寄存器值。
 - **块与偏移分析**：用块身份、字节偏移与访问宽度连接 store / load，区分可恢复的字段位置；未知偏移保守合并，支持全局初始化函数指针。
-- **过程间分析**：连接参数与返回寄存器，在同一个 Datalog 不动点中更新值集和调用图。
+- **过程间分析**：连接参数与返回寄存器；栈参数结合调用点 SP 和到达写入快照映射，在同一个 Datalog 不动点中更新值集和调用图。
 - **诊断与评估**：输出未解析调用、未知语义提示，并可利用 DWARF 评估内存块边界。
 
 ### 分析流程
@@ -155,6 +155,7 @@ BPA/
 │   ├── generate_facts.py             # ELF / CFG / VEX 事实提取
 │   ├── memory_model.py               # 有限标量、栈偏移与分配点预分析
 │   ├── offset_model.py               # 精确值完整性认证与位移输入
+│   ├── stack_arguments.py            # 调用点栈写入快照，区分实参槽复用
 │   └── vex2Datalog/
 │       ├── parser.py                 # VEX 表达式和语句转换
 │       └── DatalogFacts.py           # ID 分配及 TSV facts 写出
@@ -181,10 +182,12 @@ BPA/
 │   ├── test_memory_model.py          # 32/64 位栈位移
 │   ├── test_offset_rules.py          # 偏移规则与未知值反例
 │   ├── test_offsets.py               # 三种模式的原生精度与性能对照
+│   ├── test_stack_arguments.py       # 参数槽、分支、复用、递归与延迟 SP
 │   └── test_pipeline_resources.py    # 峰值内存统计独立性
 ├── docs/
 │   ├── ALGORITHM_WALKTHROUGH.md       # 从分块到调用目标的样例推导与实测
 │   ├── OFFSET_ANALYSIS.md             # 默认偏移模式、限制与回归结果
+│   ├── STACK_ARGUMENTS.md             # 调用点 SP、参数槽换算与传参快照
 │   ├── FACTS.md                      # facts 字段与语义
 │   ├── REQUIREMENTS.md               # 环境配置与故障排查
 │   └── examples/callback_walkthrough.c # 基础回调及覆盖赋值对照样例
@@ -272,6 +275,9 @@ build/program-analysis/
 | `points_to_offset.facts` | 表达式、块、偏移种类、字节偏移 |
 | `memory_code_offset.facts` / `memory_pointer_offset.facts` | 带位置与访问宽度的函数地址、数据指针；指针目标也携带偏移 |
 | `memory_unknown_offset.facts` | 无法完整建模的内存内容及其位置 |
+| `call_stack.facts` / `call_stack_offset.facts` | 调用前 SP 表达式、认证的 entry-SP 偏移 |
+| `call_stack_store.facts` | 每个调用点可能到达的已认证栈写入 |
+| `stack_argument_map.facts` | 实参槽到形参槽的坐标映射及保守回退原因 |
 | `points_to.facts` | 移除偏移后的块级投影，用于兼容和查看 |
 | `memory_code.facts` / `memory_pointer.facts` | 移除位置后的块级内容投影；不能据此判断字段是否混合 |
 | `store_to_aloc.facts` / `load_from_aloc.facts` | 内存访问与候选块的映射 |
@@ -282,7 +288,7 @@ build/program-analysis/
 
 facts 为无表头 TSV。空目标集应结合 `unresolved_call`、`uncertain_call` 和日志理解，不能据此认定运行时没有调用。完整字段定义见 [FACTS.md](docs/FACTS.md)。
 
-`summary.json` 的 `analysis_resources` 记录最终 Soufflé 求解命令的墙钟耗时和峰值 RSS（KiB，包含预处理器），不代表整个 Python / angr 流水线的内存。`stages` 记录各阶段耗时，`offsets` 记录偏移事实数量。峰值 RSS 通过可选 GNU time 测量，缺失时为 `null`。
+`summary.json` 的 `analysis_resources` 记录最终 Soufflé 求解命令的墙钟耗时和峰值 RSS（KiB，包含预处理器），不代表整个 Python / angr 流水线的内存。`stages` 记录各阶段耗时，`offsets` 记录偏移事实数量，`stack_arguments` 统计 SP 认证、写入快照和映射情况。峰值 RSS 通过可选 GNU time 测量，缺失时为 `null`。
 
 ## 回归测试
 
@@ -296,7 +302,7 @@ uv run --locked python tests/run_all.py
 
 完整验证结果保存到 `build/validation/results.json`，包括状态、失败详情、代码版本与各模式指标；基础案例在 `build/regressions/results.json`，偏移对照在 `build/offset-regressions/results.json`。只有完整对照且所有断言通过时，偏移报告才标记 `completed`。寄存器与单参数回调案例检查目标集合精确相等；保守内存案例检查预期目标均被找到，并单独统计额外候选。
 
-也可单独运行 `tests/run_regressions.py`、`tests/test_memory_model.py`、`tests/test_offset_rules.py`、`tests/test_offsets.py` 或 `tests/test_pipeline_resources.py`。完整回归涵盖 17 次基础原生分析，以及 9 个偏移测试二进制 × 3 种模式的 27 次对照；这些是固定小样例的验证结果。
+也可单独运行 `tests/run_regressions.py`、`tests/test_memory_model.py`、`tests/test_offset_rules.py`、`tests/test_stack_arguments.py`、`tests/test_offsets.py` 或 `tests/test_pipeline_resources.py`。完整回归涵盖 17 次基础原生分析，以及 11 个偏移测试二进制 × 3 种模式的 33 次对照；这些是固定小样例的验证结果。
 
 ## 使用 uv 管理环境
 
@@ -332,9 +338,9 @@ uv export --locked --no-hashes --no-emit-project \
 ## 当前限制
 
 - 当前主要支持 Linux AMD64 / X86 ELF，依赖函数符号；完整 stripped 函数恢复尚未实现。
-- 寄存器区分定义版本；内存采用流不敏感弱更新，过程间分析上下文不敏感。
+- 寄存器区分定义版本；普通内存采用流不敏感弱更新，栈传参额外使用调用点到达写入快照；过程间分析上下文不敏感。
 - 每个函数一个栈帧块、每个全局 section 一个块；堆按分配点建块。默认在块内保留可证明的偏移，重复位移、未知索引、无法恢复的栈对齐等仍会退化，产生额外候选。
-- 栈参数按可读参数槽接收调用者帧内容，尚未逐个匹配实参槽；同一分配点的动态对象仍合并。`memcpy` / `realloc` 等摘要暂将目的位置退化为未知，未精确建模复制字节范围。
+- 栈参数在 SP 与地址可认证时按槽位置映射，未知 SP / 别名仍保守回退；共享被调函数入口会合并不同调用上下文。当前面向 X86 cdecl / AMD64 SysV 的普通调用，尾调用及特殊调用约定仍需补充。同一分配点的动态对象合并；`memcpy` / `realloc` 等摘要暂将目的位置退化为未知。
 - X86 堆分配大小暂以 unknown 保留；仅有基础分配器与部分内存函数摘要。
 - 尚未完整覆盖 C++、异常、尾调用、全部 VEX 操作、库函数副作用、外部回调，以及动态分配器函数指针。
 - 回归结果只描述当前测试集。本项目是研究基线，尚不提供对任意二进制的 soundness 保证。
@@ -343,6 +349,11 @@ uv export --locked --no-hashes --no-emit-project \
 
 - [从内存分块到间接调用目标：算法逐步推导](docs/ALGORITHM_WALKTHROUGH.md)
 - [0-base 偏移分析、模式对照与验证结果](docs/OFFSET_ANALYSIS.md)
+- [跨函数栈参数映射与调用点写入快照](docs/STACK_ARGUMENTS.md)
+- [与 BPA-X 的大型程序对照实验清单](docs/LARGE_SCALE_EVALUATION.md)
+- [BPA-X 架构差异、功能对齐顺序与验收标准](docs/BPAX_ALIGNMENT_PLAN.md)
+- [BPA-X 同二进制首轮实测及大型程序覆盖缺口](docs/experiments/20261026_PILOT_RESULTS.md)
+- [SIMD 写入函数指针的漏边复现](docs/experiments/20261026_VECTOR_DIAGNOSTIC.md)
 - [环境配置与故障排查](docs/REQUIREMENTS.md)
 - [Facts schema v2](docs/FACTS.md)
 - [angr](https://angr.io/) · [Soufflé](https://souffle-lang.github.io/) · [uv](https://docs.astral.sh/uv/)

@@ -14,6 +14,7 @@ import run_regressions
 import test_memory_model
 import test_offset_rules
 import test_pipeline_resources
+import test_stack_arguments
 import test_offsets
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     modules = (run_regressions, test_memory_model, test_offset_rules,
-               test_pipeline_resources, test_offsets)
+               test_pipeline_resources, test_stack_arguments, test_offsets)
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromModule(module)
                                for module in modules)
     started = time.perf_counter()

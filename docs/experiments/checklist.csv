@@ -1,0 +1,19 @@
+id,priority,experiment,prerequisites,matrix_or_scope,deliverables,status
+P00,P0,代码与环境冻结,两仓库版本和补丁;依赖锁;CPU内存;GCC和Souffle版本,共同小样例和全部大型配置,env.json;source_snapshot;SHA256,completed_pilot_snapshot
+P01,P0,统一评估口径,固定调用点全集;地址和函数名归一化;失败和空集保留,同一ELF上的两工具输出,normalized_edges;callsite_status;metric_definitions,completed_nonpie_pilot
+P02,P0,两工具共同小样例核验,使用同一个ELF;人工确认完整目标真值,字段;参数;槽复用;内部指针;分支;递归;循环;未知SP,逐点TP_FP_FN;差异边;运行日志,partial_11_common_elf
+P03,P0,独立消融开关,新增粗参数摘要与关闭写入快照的独立开关,A0与A1;保持其余输入和规则一致,实验flags;开关语义测试;版本记录,not_implemented
+P04,P0,私有SPEC构建和原生校验,GCC13.3;输入树只读;私有output_root,首批xz和x264;随后8个纯C;32/64位;O0/O2,ELF和hash;构建日志;test输出校验;调用点清单,partial_xz_x264_8elf_validated
+P05,P0,动态采样器,验证32/64位普通间接CALL;采样真实目标和模块地址,先已知小程序;再test/train/ref,trace工具源码;trace完整性;小例子覆盖验证,partial_gdb_validated_not_scalable
+E01,P1,精确真值的功能对照,P00-P02,同一组受控小样例;双方相同ELF,TP_FP_FN;逐调用点差异,completed_11elf_44runs
+E02,P1,大型程序端到端对照,P00-P05,先8个ELF;后32个主配置;B/U0/U1/U2,AICT和分位数;覆盖和解析率;观察召回;漏边清单,pilot_32runs_7completed_25timeout
+E03,P1,块内偏移消融,P03;统一块划分和前端,U0/U1/A0;优先首批子集,目标减少;未知偏移;字段案例;时间内存和关系规模,partial_U0_U1_U2_no_A0
+E04,P1,栈参数映射和快照消融,P03,A0/A1/U2;X86参数;AMD64第7/8参数;槽复用,逐点差异;SP认证;快照与映射规模;未观察边复核,partial_parameter_fixtures_no_A0_A1
+E05,P1,优化和控制流覆盖,正常优化构建;明确普通CALL和尾调用范围,O0/O2主表;O1/O3扩展,前端覆盖;尾调用;不支持语义;新增调用链漏边,pilot_O0_O2_coverage_gaps
+E06,P1,时间内存和完成率,统一线程预算和外层计时;独立输出,所有正式配置;成功配置重复3次,总/阶段耗时;RSS口径;进程组峰值;OOM/timeout;facts规模,pilot_measured_no_3repeats
+E07,P1,动态workload覆盖,P05;原生输出正确;固定输入hash,test/train/ref分别记录并取并集,新增观察边;observed_recall;动态漏边;trace状态,partial_8elf_10000events_each
+E08,P1,差异边人工复核,E02/E07,约30-50个分层样本;包含收益和退化案例,源码机器码证据;确认FP/真边/证据不足分类,partial_SIMD_reproduction
+E09,P2,分块与布局辅助对照,可选固定块导入适配,共同块机制实验;BPA-X symtbl/dwarf额外信息组,边界Wrong/Miss;布局信息来源;目标与代价变化,planned
+E10,P2,鲁棒性和符号条件,P01-P05,PIE;无debug但有symtab;未知SP;stripped限制组,输出一致性;地址规范化;失败与unsupported状态,planned
+E11,P2,线程与规模扩展,固定数据和资源预算,固定子集-j1/2/4,速度;内存;结果集合一致性;关系规模曲线,planned
+E12,P3,编译器服务器语言扩展,主实验完成;另行固定版本和输入,可选GCC9.2;服务器;C++边界组,新环境元数据;分组结果;限制案例,planned

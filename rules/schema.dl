@@ -33,6 +33,8 @@
 .input call_input
 .decl call_output(stmt:number, reg:number, value:number)
 .input call_output
+.decl call_stack(stmt:number, value:number)
+.input call_stack
 .decl return_block(func:symbol, bb:number)
 .input return_block
 .decl global_region(name:symbol, start:number, end:number)
