@@ -30,6 +30,7 @@
 .input numeric_top
 
 .decl reachable_func(func:symbol)
+.decl analyzed_func(func:symbol)
 .decl call_edge(stmt:number, callee:symbol)
 .decl external_edge(stmt:number, name:symbol)
 .decl flow(source:number, dest:number)
@@ -39,13 +40,20 @@
 .decl memory_pointer(block:symbol, target:symbol)
 
 reachable_func(f) :- root(f).
-reachable_func(g) :- call_edge(_,g).
+reachable_func(g) :- call_edge(s,g), call(s,f,_,_,_,_), reachable_func(f).
+analyzed_func(f) :- root(f).
+analyzed_func(f) :- analysis_root(f).
+analyzed_func(g) :- call_edge(_,g).
 flow(a,b) :- copy(a,b).
 flow(a,b) :- def_use(a,b).
 // Register actual/formal and return edges are added as targets become known.
 flow(a,b) :- call_edge(s,g), call_input(s,r,a), entry_reg(g,r,b), !abi_sp(r).
-// Defined callees provide the actual exit definition of each clobbered register.
-flow(a,b) :- call_edge(s,g), exit_reg(g,r,a), call_output(s,r,b).
+// A tail-result proxy is a function result, not a physical register definition
+// after a jump. Value flow remains recursive through arbitrary tail chains.
+.decl function_return_value(func:symbol, reg:number, value:number)
+function_return_value(f,r,a) :- exit_reg(f,r,a).
+function_return_value(f,r,a) :- tail_call(s), call(s,f,_,_,_,_), call_output(s,r,a).
+flow(a,b) :- call_edge(s,g), function_return_value(g,r,a), call_output(s,r,b).
 flow(a,b) :- external_edge(s,n),
     (n = "memcpy"; n = "memmove"; n = "strcpy"; n = "memset"),
     call_input(s,r,a), abi_first_arg(r), call_output(s,ret,b), abi_return(ret).
@@ -58,22 +66,30 @@ code_value(e,a) :- scalar(e,a), external(a,_).
 code_value(b,a) :- flow(e,b), code_value(e,a).
 #include "offset_memory.dl"
 
-call_edge(s,g) :- call(s,f,_,_,e,_), reachable_func(f), code_value(e,a), function(g,a,_).
-external_edge(s,n) :- call(s,f,_,_,e,_), reachable_func(f), code_value(e,a), external(a,n).
+call_edge(s,g) :- call(s,f,_,_,e,_), analyzed_func(f), code_value(e,a), function(g,a,_).
+external_edge(s,n) :- call(s,f,_,_,e,_), analyzed_func(f), code_value(e,a), external(a,n).
 
 .decl store_to_aloc(instr:number, value:number, block:symbol)
-store_to_aloc(a,v,b) :- store(_,f,a,_,e,v), reachable_func(f), points_to(e,b).
+store_to_aloc(a,v,b) :- store(_,f,a,_,e,v), analyzed_func(f), points_to(e,b).
 .decl load_from_aloc(instr:number, value:number, block:symbol)
-load_from_aloc(a,v,b) :- load(_,f,a,_,e,v), reachable_func(f), points_to(e,b).
+load_from_aloc(a,v,b) :- load(_,f,a,_,e,v), analyzed_func(f), points_to(e,b).
 .decl indirect_call_target(callSite:number, targetFunc:symbol)
-indirect_call_target(a,g) :- call(s,_,_,a,_,1), call_edge(s,g).
+indirect_call_target(a,g) :- call(s,_,_,a,_,1), !tail_call(s), call_edge(s,g).
+.decl tail_call_target(callSite:number, targetFunc:symbol)
+tail_call_target(a,g) :- tail_call(s), call(s,_,_,a,_,_), call_edge(s,g).
 .decl call_graph(caller:symbol, callee:symbol, site:number)
 call_graph(f,g,a) :- call(s,f,_,a,_,_), call_edge(s,g).
 .decl interproc_edge(source:number, target:number, kind:symbol)
-interproc_edge(a,entry,"call") :- call(s,_,_,a,_,_), call_edge(s,g), function(g,entry,_).
-interproc_edge(ret,dest,"return") :- call(s,f,b,_,_,_), call_edge(s,g), return_block(g,ret), edge(f,b,dest,"Ijk_FakeRet").
+interproc_edge(a,entry,"call") :- call(s,_,_,a,_,_), !tail_call(s), call_edge(s,g), function(g,entry,_).
+interproc_edge(a,entry,"tail-call") :- tail_call(s), call(s,_,_,a,_,_), call_edge(s,g), function(g,entry,_).
+.decl return_continuation(func:symbol, dest:number)
+return_continuation(g,dest) :- call(s,f,b,_,_,_), !tail_call(s), call_edge(s,g), edge(f,b,dest,"Ijk_FakeRet").
+return_continuation(g,dest) :- tail_call(s), call(s,f,_,_,_,_), call_edge(s,g), return_continuation(f,dest).
+interproc_edge(ret,dest,"return") :- return_block(g,ret), return_continuation(g,dest).
 .decl unresolved_call(site:number)
-unresolved_call(a) :- call(s,f,_,a,_,1), reachable_func(f), !call_edge(s,_), !external_edge(s,_).
+unresolved_call(a) :- call(s,f,_,a,_,1), !tail_call(s), analyzed_func(f), !call_edge(s,_), !external_edge(s,_).
+.decl unresolved_tail_call(site:number)
+unresolved_tail_call(a) :- tail_call(s), call(s,f,_,a,_,_), analyzed_func(f), !call_edge(s,_), !external_edge(s,_).
 .decl value_set(eid:number, value:number)
 value_set(e,a) :- code_value(e,a).
 .decl external_call_target(site:number, name:symbol)
@@ -89,9 +105,11 @@ unknown_value(e) :- binary(e,_,_,_,a), unknown_value(a).
 unknown_value(e) :- binary(e,_,_,a,_), code_value(a,_).
 unknown_value(e) :- binary(e,_,_,_,a), code_value(a,_).
 unknown_value(e) :- unary(e,_,bits,a), pointer_width(w), bits < w, code_value(a,_).
-unknown_value(v) :- load(_,f,_,_,a,v), reachable_func(f), unknown_value(a).
+unknown_value(v) :- load(_,f,_,_,a,v), analyzed_func(f), unknown_value(a).
 .decl uncertain_call(site:number)
-uncertain_call(a) :- call(_,f,_,a,e,1), reachable_func(f), unknown_value(e).
+uncertain_call(a) :- call(s,f,_,a,e,1), !tail_call(s), analyzed_func(f), unknown_value(e).
+.decl uncertain_tail_call(site:number)
+uncertain_tail_call(a) :- tail_call(s), call(s,f,_,a,e,_), analyzed_func(f), unknown_value(e).
 
 .output code_value(filename="code_value.facts")
 .output value_set(filename="value_set.facts")
@@ -104,6 +122,12 @@ uncertain_call(a) :- call(_,f,_,a,e,1), reachable_func(f), unknown_value(e).
 .output interproc_edge(filename="interproc_edge.facts")
 .output indirect_call_target(filename="indirect_call_target.facts")
 .output reachable_func(filename="reachable_func.facts")
+.output analyzed_func(filename="analyzed_func.facts")
+.output function_return_value(filename="function_return_value.facts")
+.output return_continuation(filename="return_continuation.facts")
+.output tail_call_target(filename="tail_call_target.facts")
+.output unresolved_tail_call(filename="unresolved_tail_call.facts")
+.output uncertain_tail_call(filename="uncertain_tail_call.facts")
 .output unresolved_call(filename="unresolved_call.facts")
 .output uncertain_call(filename="uncertain_call.facts")
 .output external_call_target(filename="external_call_target.facts")

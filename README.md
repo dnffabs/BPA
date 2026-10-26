@@ -2,7 +2,7 @@
 
 面向 ELF 二进制的块级指针分析研究原型：通过 **angr / VEX IR** 提取程序语义，使用 **Soufflé Datalog** 联合求解指针值传播、过程间调用关系与间接调用目标。
 
-项目采用 BPA / BPA-X 的内存块分析思路，并加入 BinPointer 启发的 **0-base 块内偏移分析**。默认跟踪“块＋偏移”，同时提供块级基线作对照。当前使用 **facts schema v2＋offset 扩展 v2**，Python 环境与依赖由 **uv** 管理。
+项目采用 BPA / BPA-X 的内存块分析思路，并加入 BinPointer 启发的 **0-base 块内偏移分析**。默认跟踪“块＋偏移”，同时提供块级基线作对照。当前使用 **facts schema v2＋offset 扩展 v2＋control 扩展 v1**，Python 环境与依赖由 **uv** 管理。
 
 [环境要求](#环境要求) · [快速开始](#快速开始) · [算法逐步推导](docs/ALGORITHM_WALKTHROUGH.md) · [偏移分析与实测](docs/OFFSET_ANALYSIS.md) · [项目结构](#项目结构) · [使用方法](#使用方法) · [输出说明](#输出说明) · [回归测试](#回归测试) · [当前限制](#当前限制)
 
@@ -12,6 +12,7 @@
 - **寄存器定义追踪**：按基本块和 VEX 语句顺序建立定义与读取关系，区分覆盖赋值前后的寄存器值。
 - **块与偏移分析**：用块身份、字节偏移与访问宽度连接 store / load，区分可恢复的字段位置；未知偏移保守合并，支持全局初始化函数指针。
 - **过程间分析**：连接参数与返回寄存器；栈参数结合调用点 SP 和到达写入快照映射，在同一个 Datalog 不动点中更新值集和调用图。
+- **控制流对齐**：导入共享函数范围，选择入口/入口＋AT 根策略；支持受限直接/间接尾调用、参数传递和继承返回关系，独立统计调用点覆盖。
 - **诊断与评估**：输出未解析调用、未知语义提示，并可利用 DWARF 评估内存块边界。
 
 ### 分析流程
@@ -214,6 +215,8 @@ uv run --locked ./pipeline/run.sh /path/to/program \
 | `binary` | 必填 | 待分析 ELF 路径 |
 | `--output`, `-o` | `build/<名称>_<路径哈希>_dir` | 保存本次分析产物 |
 | `--entry` | `main` | 分析入口函数名 |
+| `--functions` | 从符号生成 | 使用绑定 ELF SHA256 的共同函数范围 JSON（ELF RVA） |
+| `--roots` | `main` | `main` 从入口分析；`main-and-at` 同时分析取地址函数，入口可达闭包另行记录 |
 | `--jobs`, `-j` | `4` | Soufflé 线程数 |
 | `--memory-model` | `offset` | `block` 块级对照；`heap-offset` 仅堆启用偏移；`offset` 全部内存启用偏移 |
 | `--compare` | 关闭 | 使用 DWARF 评估内存边界 |
@@ -231,7 +234,9 @@ uv run --locked ./pipeline/run.sh build/demo --memory-model offset --output buil
 
 仅堆启用偏移时，栈中的粗别名仍可能污染堆读写。字段、重复覆盖、循环和跨函数示例见 [偏移分析与实测](docs/OFFSET_ANALYSIS.md)。
 
-输入需保留 `.symtab` 中已定义函数的入口与大小。DWARF 调试信息仅用于 `--compare`：没有 DWARF 时跳过评估，主分析仍可运行；完全 stripped 的输入会明确报错。
+默认从 `.symtab` 中获取已定义函数的入口与大小；也可通过 `--functions` 提供共同边界。给定经验证边界的 stripped 分析已有测试，自动 stripped 函数恢复仍未实现。DWARF 仅用于 `--compare`，缺少 DWARF 时跳过边界评估。接口示例见 [控制流对齐](docs/CONTROL_FLOW_ALIGNMENT.md)。
+
+所有调用点的独立覆盖清单保存在 `coverage.json`，函数来源、AT 根、分析范围与入口可达状态保存在 `function_coverage.json`；普通间接 CALL 和尾调用目标分开输出。
 
 ### 单独执行某一阶段
 
@@ -281,7 +286,7 @@ build/program-analysis/
 | `points_to.facts` | 移除偏移后的块级投影，用于兼容和查看 |
 | `memory_code.facts` / `memory_pointer.facts` | 移除位置后的块级内容投影；不能据此判断字段是否混合 |
 | `store_to_aloc.facts` / `load_from_aloc.facts` | 内存访问与候选块的映射 |
-| `call_resolution.facts` | 所有可达间接调用点及其用户、外部目标数，保留空结果 |
+| `call_resolution.facts` | 参与分析的普通间接调用点及其用户、外部目标数；独立全集与未分析点见 coverage.json |
 | `unresolved_call.facts` | 尚未解析出目标的间接调用点 |
 | `uncertain_call.facts` | 受 unknown 语义影响的调用点，可能已解析出部分目标 |
 | `unsupported.facts` | 尚未完整建模的语句或表达式 |
@@ -337,10 +342,10 @@ uv export --locked --no-hashes --no-emit-project \
 
 ## 当前限制
 
-- 当前主要支持 Linux AMD64 / X86 ELF，依赖函数符号；完整 stripped 函数恢复尚未实现。
+- 当前主要支持 Linux AMD64 / X86 ELF，默认依赖函数符号，也可导入共同函数清单；自动 stripped 函数恢复尚未实现。
 - 寄存器区分定义版本；普通内存采用流不敏感弱更新，栈传参额外使用调用点到达写入快照；过程间分析上下文不敏感。
 - 每个函数一个栈帧块、每个全局 section 一个块；堆按分配点建块。默认在块内保留可证明的偏移，重复位移、未知索引、无法恢复的栈对齐等仍会退化，产生额外候选。
-- 栈参数在 SP 与地址可认证时按槽位置映射，未知 SP / 别名仍保守回退；共享被调函数入口会合并不同调用上下文。当前面向 X86 cdecl / AMD64 SysV 的普通调用，尾调用及特殊调用约定仍需补充。同一分配点的动态对象合并；`memcpy` / `realloc` 等摘要暂将目的位置退化为未知。
+- 栈参数在 SP 与地址可认证时按槽位置映射，未知 SP / 别名仍保守回退；共享被调函数入口会合并不同调用上下文。支持 X86 cdecl / AMD64 SysV 的普通调用与受限尾调用；间接尾调用需排除跳转表并认证入口 SP 恢复，特殊调用约定仍待扩展。同一分配点动态对象合并；`memcpy` / `realloc` 等摘要暂将目的位置退化为未知。
 - X86 堆分配大小暂以 unknown 保留；仅有基础分配器与部分内存函数摘要。
 - 尚未完整覆盖 C++、异常、尾调用、全部 VEX 操作、库函数副作用、外部回调，以及动态分配器函数指针。
 - 回归结果只描述当前测试集。本项目是研究基线，尚不提供对任意二进制的 soundness 保证。
@@ -352,6 +357,7 @@ uv export --locked --no-hashes --no-emit-project \
 - [跨函数栈参数映射与调用点写入快照](docs/STACK_ARGUMENTS.md)
 - [与 BPA-X 的大型程序对照实验清单](docs/LARGE_SCALE_EVALUATION.md)
 - [BPA-X 架构差异、功能对齐顺序与验收标准](docs/BPAX_ALIGNMENT_PLAN.md)
+- [已实现：共同函数输入、AT 根策略和尾调用](docs/CONTROL_FLOW_ALIGNMENT.md)
 - [BPA-X 同二进制首轮实测及大型程序覆盖缺口](docs/experiments/20261026_PILOT_RESULTS.md)
 - [SIMD 写入函数指针的漏边复现](docs/experiments/20261026_VECTOR_DIAGNOSTIC.md)
 - [环境配置与故障排查](docs/REQUIREMENTS.md)

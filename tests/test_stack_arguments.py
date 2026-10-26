@@ -59,6 +59,17 @@ class StackArgumentMapping(unittest.TestCase):
                 self.assertTrue(all(row[-1] == 'exact' for row in maps))
                 self.assertFalse(read_rows(path, 'uncertain_call'))
 
+    def test_tail_arguments_reuse_return_address_without_extra_word(self):
+        for bits in (32,64):
+            word = bits//8
+            path = self.case('tail_'+str(bits),bits,extra={'tail_call':[(100,)]},replacements={
+                'call_stack':[(100,1)],
+                'binary':[(10,f'Add{bits}',bits,1,4),(11,f'Add{bits}',bits,1,5),
+                          (12,f'Add{bits}',bits,2,4),(13,f'Add{bits}',bits,2,5)]})
+            self.assertEqual(self.codes(path,20),{2000})
+            self.assertEqual(self.codes(path,21),{3000})
+            self.assertTrue(all(r[-1]=='exact' for r in read_rows(path,'stack_argument_map')))
+
     def test_incomplete_sp_retains_all_candidates(self):
         path = self.case('unknown_sp', extra={
             'unknown_seed': [(90,)], 'copy': [(90, 10)],

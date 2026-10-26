@@ -4,6 +4,23 @@
 
 原始前端使用 schema v2；扩展 v2 增加调用点 SP 与栈写入快照，`summary.json` 记录 `offset_schema: 2` 和 `memory_model`。旧 facts 目录需重新执行流水线，生成新扩展所需输入。
 
+`control_schema: 1` 增加共同函数输入、根策略与尾调用。JSON 边界/覆盖文件采用 ELF RVA，TSV 机器地址继续采用 CLE 映射虚拟地址；两者通过 metadata.mapped_base 换算。详见 [控制流对齐接口](CONTROL_FLOW_ALIGNMENT.md)。
+
+## 控制流扩展 v1
+
+- `constant_origin(eid,func,addr)`：作为数据使用的地址常量出处，排除直接分支目标本身。
+- `address_taken(func,source,addr)` / `external_address_taken(target,source,addr)`：instruction/global 取地址证据。
+- `analysis_root(func)` / `root_reason(func,reason)`：附加分析根及来源；`root` 仍保存实际入口。
+- `analyzed_func(func)` / `reachable_func(func)`：附加根参与的分析闭包与仅从入口出发的静态闭包。
+- `call_kind(stmt,kind)`：call / tail / tail-candidate；`tail_call(stmt)` 表示已确认尾调用。
+- `tail_candidate(stmt,func,bb,addr,target,indirect)`：间接跳转候选，保留认证前的证据。
+- `tail_evidence(stmt,reason)`：直接函数入口、未解决非索引跳转、入口 SP 恢复等依据。
+- 尾调用也进入 `call` 和 `call_graph`，但内部尾调用目标输出到 `tail_call_target`，普通机器间接 CALL 输出到 `indirect_call_target`。
+- `function_return_value(func,reg,value)`：真实返回定义或尾结果代理；`return_continuation(func,dest)`：可沿尾链继承的返回 BB。
+- `unresolved_tail_call(site)` / `uncertain_tail_call(site)`：独立尾调用诊断。
+
+`call_input` 对普通与尾调用均保存转移前寄存器读。尾 `call_output` 是摘要结果代理，不创建跳转后的物理 `reg_def`。普通 CALL 的栈映射有一个字长偏置，尾调用偏置为零；尾链通过 argument_read 反向传递参数需求。
+
 ## 身份
 
 - `statement(stmt, function, bb, machine_address, position)`：position 是 VEX 语句在 IRSB 内的完整顺序。

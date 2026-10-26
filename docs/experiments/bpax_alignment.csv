@@ -1,12 +1,12 @@
 id,milestone,category,current_status,action,primary_files,acceptance
-A01,M0,函数与覆盖输入,partial,记录函数来源范围和独立调用点全集;区分retained/reachable/unknown,tools/generate_facts.py;tools/run_pipeline.py,相同ELF分母一致;动态调用点都有状态;失败结果为null
-A02,M0,AT与分析根,missing_compatibility_policy,增加AT候选和main/main+AT策略并记录配置,tools/generate_facts.py;rules/analysis.dl,候选不被当成已证明可达;根策略差异可以隔离
-A03,M1,尾调用,missing,增加直接间接尾调用及继承返回续点;分别处理SP坐标,tools/vex2Datalog/parser.py;rules/schema.dl;rules/analysis.dl,尾调用链参数返回和后继普通间接调用不漏
+A01,M0,函数与覆盖输入,implemented_shared_manifest_independent_coverage,记录函数来源范围和独立调用点全集;区分retained/reachable/unknown,tools/generate_facts.py;tools/run_pipeline.py,相同ELF分母一致;动态调用点都有状态;失败结果为null
+A02,M0,AT与分析根,implemented_main_and_at_separate_reachability,增加AT候选和main/main+AT策略并记录配置,tools/generate_facts.py;rules/analysis.dl,候选不被当成已证明可达;根策略差异可以隔离
+A03,M1,尾调用,implemented_guarded_tail_calls_tested_x86_amd64,增加直接间接尾调用及继承返回续点;分别处理SP坐标,tools/vex2Datalog/parser.py;rules/schema.dl;rules/analysis.dl,尾调用链参数返回和后继普通间接调用不漏
 A04,M1,过程间寄存器流,partial_unproven_equivalence,核验caller/callee saved和新目标返回定义;按证据补动态RD或摘要,rules/ssa.dl;rules/analysis.dl;tools/generate_facts.py,嵌套递归多返回和保存寄存器精确真值无新增FN
 A05,M1,标量宽度与操作,partial,列出cast/ITE/地址运算/子寄存器读写矩阵并补语义,tools/vex2Datalog/parser.py;rules/analysis.dl,有效零扩展截断往返不漏;无依据的截断标未知
 A06,M2,对象分块,different_abstraction,增加代码推断多对象划分;分块与偏移独立配置,tools/memory_model.py;rules/stack_boundary.dl;rules/global_boundary.dl,细块访问和内部指针保持一致;未知数组访问有对象回退
 A07,M2,只读和全局初始化,partial_missing_ro_guard,保存权限和重定位信息;保护只读块;核对函数/PLT初值,tools/generate_facts.py;rules/offset_memory.dl,伪别名写不污染只读表;PLT回调分列解析
-A08,M2,栈参数,enhanced_but_tail_missing,普通尾调用分别映射;独立控制映射与快照,tools/stack_arguments.py;rules/offset_memory.dl;tools/offset_model.py,32位与AMD64第7/8参数及未知SP回退正确
+A08,M2,栈参数,ordinary_tail_mapping_supported_ablation_pending,普通尾调用分别映射;独立控制映射与快照,tools/stack_arguments.py;rules/offset_memory.dl;tools/offset_model.py,32位与AMD64第7/8参数及未知SP回退正确
 A09,M2,分配器与库摘要,partial_shared_limits,核对支持列表;补X86库参数读取;包装分配器按需求扩展,tools/memory_model.py;rules/offset_memory.dl,每项摘要有ABI和原生案例;未覆盖项可见
 A10,M3,连接规模,profile_hotspot_confirmed,去重参数源候选和优化回退连接;保持未知分支语义,rules/offset_memory.dl;tools/stack_arguments.py,相同输入输出集合不变;profile显示连接开销下降
 A11,M3,大型功能基线,not_aligned,完成BPA-X已完成的4个xz配置;审计目标差异,docs/experiments/20261026_PILOT_RESULTS.md,同预算完成率达到基线;动态真边和unknown状态完整报告

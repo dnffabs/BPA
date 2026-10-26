@@ -16,13 +16,14 @@ import test_offset_rules
 import test_pipeline_resources
 import test_stack_arguments
 import test_offsets
+import test_alignment
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
     modules = (run_regressions, test_memory_model, test_offset_rules,
-               test_pipeline_resources, test_stack_arguments, test_offsets)
+               test_pipeline_resources, test_stack_arguments, test_offsets, test_alignment)
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromModule(module)
                                for module in modules)
     started = time.perf_counter()
@@ -45,8 +46,9 @@ def main():
         'elapsed_seconds': round(time.perf_counter() - started, 4),
         'baseline_native_analyses': len(run_regressions.RESULTS),
         'offset_native_analyses': len(test_offsets.RESULTS),
+        'alignment_native_analyses': len(test_alignment.RESULTS),
         'offset_totals': {mode: test_offsets.mode_totals(mode) for mode in test_offsets.MODES},
-        'reports': ['build/regressions/results.json', 'build/offset-regressions/results.json'],
+        'reports': ['build/regressions/results.json', 'build/offset-regressions/results.json', 'build/alignment-regressions/results.json'],
     }
     destination.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
     print(f'Validation report: {destination}')

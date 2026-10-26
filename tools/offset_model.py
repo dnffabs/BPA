@@ -66,6 +66,8 @@ def prepare(directory, values, top, mode):
         complete.update(ready)
         pending.difference_update(ready)
     write_rows(directory, 'complete_value', ((eid,) for eid in complete))
+    from control_flow import promote
+    promote(directory, values, complete)
     # Dynamic pointer arithmetic uses literal displacements only. A partially
     # known scalar set must never silently exclude unknown alternatives.
     write_rows(directory, 'offset_literal',

@@ -10,6 +10,7 @@ class VexParser:
         self.func = ""
         self.irsb = None
         self.expression_counter = 0
+        self.in_terminator = False
 
     def tmp(self, number):
         eid = self.facts.eid(("tmp", self.bb, number))
@@ -42,6 +43,8 @@ class VexParser:
             if value >= 1 << 63:
                 value -= 1 << 64
             self.facts.add("constant", eid, bits, value)
+            if not self.in_terminator:
+                self.facts.add("constant_origin", eid, self.func, self.address)
         elif tag == "Iex_Get":
             loc, width = self.reg(expr.offset, max(1, bits // 8))
             self.facts.add("reg_read", self.stmt, self.func, self.bb, self.order, loc, eid)
@@ -62,9 +65,10 @@ class VexParser:
             self.unknown(eid, tag)
         return eid
 
-    def parse(self, block, function):
+    def parse(self, block, function, transfer_kind=None, evidence=None):
         self.irsb, self.bb, self.func = block.vex, block.addr, function
         self.expression_counter, self.address = 0, block.addr
+        self.in_terminator = False
         last = block.instruction_addrs[-1]
         is_call = self.irsb.jumpkind == "Ijk_Call"
         call_sp_after = None
@@ -108,8 +112,9 @@ class VexParser:
         self.stmt = self.facts.eid(("terminator", self.bb))
         self.address = last
         self.facts.add("statement", self.stmt, function, self.bb, last, self.order)
+        self.in_terminator = True
         target = self.expr(self.irsb.next)
-        if is_call:
+        if is_call or transfer_kind in ('tail', 'tail-candidate'):
             if call_sp_after is not None:
                 snapshot = self.facts.eid(("call_stack", self.stmt))
                 word = self.facts.eid(("call_stack_word", self.stmt))
@@ -122,7 +127,14 @@ class VexParser:
                 self.facts.add("copy", snapshot, version)
             machine = block.capstone.insns[-1].insn
             indirect = int(not machine.operands or machine.operands[0].type != 2)
-            self.facts.add("call", self.stmt, function, self.bb, last, target, indirect)
+            kind = 'call' if is_call else transfer_kind
+            relation = 'tail_candidate' if kind == 'tail-candidate' else 'call'
+            self.facts.add(relation, self.stmt, function, self.bb, last, target, indirect)
+            self.facts.add('call_kind', self.stmt, kind)
+            if kind == 'tail':
+                self.facts.add('tail_call', self.stmt)
+            if evidence:
+                self.facts.add('tail_evidence', self.stmt, evidence)
             return self.stmt, self.order
         if self.irsb.jumpkind == "Ijk_Ret":
             self.facts.add("return_block", function, self.bb)

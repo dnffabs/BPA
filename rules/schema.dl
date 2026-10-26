@@ -35,6 +35,14 @@
 .input call_output
 .decl call_stack(stmt:number, value:number)
 .input call_stack
+.decl tail_call(stmt:number)
+.input tail_call
+.decl tail_candidate(stmt:number, func:symbol, bb:number, addr:number, target:number, indirect:number)
+.input tail_candidate
+.decl call_kind(stmt:number, kind:symbol)
+.input call_kind
+.decl tail_evidence(stmt:number, reason:symbol)
+.input tail_evidence
 .decl return_block(func:symbol, bb:number)
 .input return_block
 .decl global_region(name:symbol, start:number, end:number)
@@ -45,6 +53,16 @@
 .input external
 .decl root(func:symbol)
 .input root
+.decl analysis_root(func:symbol)
+.input analysis_root
+.decl root_reason(func:symbol, reason:symbol)
+.input root_reason
+.decl address_taken(func:symbol, source:symbol, addr:number)
+.input address_taken
+.decl external_address_taken(target:number, source:symbol, addr:number)
+.input external_address_taken
+.decl constant_origin(eid:number, func:symbol, addr:number)
+.input constant_origin
 .decl stack_root(eid:number, func:symbol)
 .input stack_root
 .decl unknown_seed(eid:number)

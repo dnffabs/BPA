@@ -61,15 +61,15 @@ memory_pointer_offset(b,k,o,w/8,p,"exact",a-start) :- initial_location(b,k,o,loc
 memory_pointer_offset(b,k,o,w/8,p,"unknown",0) :- initial_location(b,k,o,loc), global_word(loc,a),
     global_aloc(p,start,n), a >= start, a < start+n, !offset_enabled(p), pointer_width(w).
 // Weak writes retain their actual location, not a summary fed back to reads.
-memory_code_offset(b,k,o,n,a) :- store(_,f,_,n,e,v), reachable_func(f), points_to_offset(e,b,k,o), code_value(v,a).
-memory_pointer_offset(b,k,o,n,p,pk,po) :- store(_,f,_,n,e,v), reachable_func(f),
+memory_code_offset(b,k,o,n,a) :- store(_,f,_,n,e,v), analyzed_func(f), points_to_offset(e,b,k,o), code_value(v,a).
+memory_pointer_offset(b,k,o,n,p,pk,po) :- store(_,f,_,n,e,v), analyzed_func(f),
     points_to_offset(e,b,k,o), points_to_offset(v,p,pk,po).
-memory_unknown_offset(b,k,o,n) :- store(_,f,_,n,e,v), reachable_func(f), points_to_offset(e,b,k,o), unknown_value(v).
+memory_unknown_offset(b,k,o,n) :- store(_,f,_,n,e,v), analyzed_func(f), points_to_offset(e,b,k,o), unknown_value(v).
 // A short store cannot represent an entire pointer value.
-memory_unknown_offset(b,k,o,n) :- store(_,f,_,n,e,_), reachable_func(f), points_to_offset(e,b,k,o), pointer_width(w), n < w/8.
+memory_unknown_offset(b,k,o,n) :- store(_,f,_,n,e,_), analyzed_func(f), points_to_offset(e,b,k,o), pointer_width(w), n < w/8.
 
 .decl read_location(value:number, block:symbol, kind:symbol, offset:number, size:number)
-read_location(v,b,k,o,n) :- load(_,f,_,n,e,v), reachable_func(f), points_to_offset(e,b,k,o).
+read_location(v,b,k,o,n) :- load(_,f,_,n,e,v), analyzed_func(f), points_to_offset(e,b,k,o).
 .decl written_location(block:symbol, kind:symbol, offset:number, size:number)
 written_location(b,k,o,n) :- memory_code_offset(b,k,o,n,_).
 written_location(b,k,o,n) :- memory_pointer_offset(b,k,o,n,_,_,_).
@@ -91,17 +91,39 @@ unknown_value(v) :- read_overlap(v,b,"unknown",0,_), offset_enabled(b).
 
 // Stack coordinates: caller entry SP = S, before-call SP = S+d.
 // Callee entry SP is S+d-word, so a caller offset x maps to x-d+word.
+// A tail jump does not push: its callee sees S+d, and the bias is zero.
 .decl call_stack_offset(stmt:number, offset:number)
 .input call_stack_offset
 .decl precise_stack_call(stmt:number)
 precise_stack_call(s) :- call_stack_offset(s,_), memory_model("offset").
+.decl argument_read(block:symbol, kind:symbol, offset:number, size:number)
+argument_read(b,k,o,n) :- read_location(_,b,k,o,n).
+// A forwarding tail function may never load its incoming stack arguments.
+// Pull the callee's demand back to the forwarder's frame before mapping the
+// original caller's writes. Exact recursion preserves absolute entry offsets
+// only when the tail SP is certified as restored (d=0), so cycles stay finite.
+argument_read(b,"exact",r+cs-bs,n) :- tail_call(s), call(s,f,_,_,_,_), call_edge(s,g),
+    stack_aloc(b,f,bs,_), stack_aloc(c,g,cs,_), precise_stack_call(s), call_stack_offset(s,0),
+    argument_read(c,"exact",r,n), pointer_width(w), r+cs+n > w/8.
+argument_read(b,"unknown",0,n) :- tail_call(s), call(s,f,_,_,_,_), call_edge(s,g),
+    stack_aloc(b,f,_,_), stack_aloc(c,g,_,_), argument_read(c,"unknown",0,n).
+argument_read(b,"unknown",0,n) :- tail_call(s), call(s,f,_,_,_,_), call_edge(s,g),
+    stack_aloc(b,f,_,_), stack_aloc(c,g,cs,_), argument_read(c,"exact",r,n),
+    pointer_width(w), r+cs+n > w/8, !precise_stack_call(s).
+argument_read(b,"unknown",0,n) :- tail_call(s), call(s,f,_,_,_,_), call_edge(s,g),
+    stack_aloc(b,f,_,_), stack_aloc(c,g,cs,_), argument_read(c,"exact",r,n),
+    pointer_width(w), r+cs+n > w/8, call_stack_offset(s,d), d != 0.
 .decl stack_argument_slot(stmt:number, caller_block:symbol, callee_block:symbol, kind:symbol, offset:number, size:number)
 // Include a wide read straddling the return-address/argument boundary.
 // Read locations may be in another function after a slot address escapes.
 stack_argument_slot(s,b,c,"exact",o,n) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_),
-    stack_aloc(c,g,start,_), read_location(_,c,"exact",o,n), pointer_width(w), o+start+n > w/8.
+    stack_aloc(c,g,start,_), argument_read(c,"exact",o,n), pointer_width(w), o+start+n > w/8.
 stack_argument_slot(s,b,c,"unknown",0,n) :- call_edge(s,g), call(s,f,_,_,_,_), stack_aloc(b,f,_,_),
-    stack_aloc(c,g,_,_), read_location(_,c,"unknown",0,n).
+    stack_aloc(c,g,_,_), argument_read(c,"unknown",0,n).
+
+.decl call_entry_bias(stmt:number, bias:number)
+call_entry_bias(s,w/8) :- call(s,_,_,_,_,_), !tail_call(s), pointer_width(w).
+call_entry_bias(s,0) :- tail_call(s).
 
 .decl stack_argument_map(stmt:number, source:symbol, source_kind:symbol, source_offset:number, source_size:number,
     dest:symbol, dest_kind:symbol, dest_offset:number, dest_size:number, mode:symbol)
@@ -109,8 +131,8 @@ stack_argument_slot(s,b,c,"unknown",0,n) :- call_edge(s,g), call(s,f,_,_,_,_), s
 // without this guard would generate unbounded offsets on recursive calls.
 stack_argument_map(s,b,"exact",o,n,c,"exact",mapped,n,"exact") :-
     stack_argument_slot(s,b,c,"exact",r,rn), precise_stack_call(s), call_stack_offset(s,d),
-    stack_aloc(b,_,bs,_), stack_aloc(c,_,cs,_), pointer_width(w),
-    written_location(b,"exact",o,n), mapped = bs+o-d+w/8-cs,
+    stack_aloc(b,_,bs,_), stack_aloc(c,_,cs,_), call_entry_bias(s,bias),
+    written_location(b,"exact",o,n), mapped = bs+o-d+bias-cs,
     mapped < r+rn, r < mapped+n.
 // Unknown write positions can reach every candidate argument slot.
 stack_argument_map(s,b,"unknown",0,n,c,"exact",r,rn,"unknown-source") :-
@@ -143,7 +165,7 @@ stack_argument_value(s,b,"exact",offset-start,n,v) :- call_stack_snapshot(s), ca
     certified_stack_store(t,offset), store(t,f,_,n,_,v), stack_aloc(b,f,start,_).
 // These writes cannot be strongly killed by the scalar/affine prepass.
 stack_argument_value(s,b,k,o,n,v) :- call_stack_snapshot(s), stack_argument_map(s,b,k,o,n,_,_,_,_,_),
-    store(t,f,_,n,e,v), reachable_func(f), !certified_stack_store(t,_), points_to_offset(e,b,k,o).
+    store(t,f,_,n,e,v), analyzed_func(f), !certified_stack_store(t,_), points_to_offset(e,b,k,o).
 
 memory_code_offset(c,dk,d,dn,a) :- stack_argument_map(s,b,k,o,n,c,dk,d,dn,_),
     stack_argument_memory_source(s,b,k,o,n), memory_code_offset(b,k,o,n,a).
